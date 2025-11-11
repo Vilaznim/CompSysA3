@@ -15,6 +15,10 @@
 
 #include "./peer.h"
 
+//prototypes for functions used only in this file
+void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out);
+int send_register_message(const NetworkAddress_t *peer_address);
+int parse_and_store_peer_list(const char *body, uint32_t body_len);
 
 // Global variables to be used by both the server and client side of the peer.
 // Note the addition of mutexs to prevent race conditions.
@@ -75,6 +79,23 @@ void* server_thread()
 
     return NULL;
 }
+
+void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out)
+{
+
+}
+
+int send_register_message(const NetworkAddress_t *peer_address)
+{
+
+}
+
+int parse_and_store_peer_list(const char *body, uint32_t body_len)
+{
+
+}
+
+
 
 
 int main(int argc, char **argv)
