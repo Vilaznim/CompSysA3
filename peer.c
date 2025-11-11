@@ -15,7 +15,7 @@
 
 #include "./peer.h"
 
-//prototypes for functions used only in this file
+// prototypes for functions used only in this file
 void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out);
 int send_register_message(const NetworkAddress_t *peer_address);
 int parse_and_store_peer_list(const char *body, uint32_t body_len);
@@ -24,26 +24,26 @@ int parse_and_store_peer_list(const char *body, uint32_t body_len);
 // Note the addition of mutexs to prevent race conditions.
 NetworkAddress_t *my_address;
 
-NetworkAddress_t** network = NULL;
+NetworkAddress_t **network = NULL;
 uint32_t peer_count = 0;
 
 /*
- * Function to act as thread for all required client interactions. This thread 
+ * Function to act as thread for all required client interactions. This thread
  * will be run concurrently with the server_thread. It will start by requesting
  * the IP and port for another peer to connect to. Once both have been provided
  * the thread will register with that peer and expect a response outlining the
  * complete network. The user will then be prompted to provide a file path to
  * retrieve. This file request will be sent to a random peer on the network.
  * This request/retrieve interaction is then repeated forever.
- */ 
-void* client_thread()
+ */
+void *client_thread()
 {
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
     scanf("%16s", peer_ip);
 
     // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i=strlen(peer_ip); i<IP_LEN; i++)
+    for (int i = strlen(peer_ip); i < IP_LEN; i++)
     {
         peer_ip[i] = '\0';
     }
@@ -53,7 +53,7 @@ void* client_thread()
     scanf("%16s", peer_port);
 
     // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i=strlen(peer_port); i<PORT_STR_LEN; i++)
+    for (int i = strlen(peer_port); i < PORT_STR_LEN; i++)
     {
         peer_port[i] = '\0';
     }
@@ -72,7 +72,7 @@ void* client_thread()
  * Function to act as basis for running the server thread. This thread will be
  * run concurrently with the client thread, but is infinite in nature.
  */
-void* server_thread()
+void *server_thread()
 {
     // You should never see this printed in your finished implementation
     printf("Server thread done\n");
@@ -82,7 +82,27 @@ void* server_thread()
 
 void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out)
 {
+    if (!password || !salt || !hash_out)
+        return;
 
+    // Combine password + salt (python uses password then salt)
+    int combined_len = password_len + SALT_LEN;
+    char *buf = malloc(combined_len);
+    if (!buf)
+    {
+        fprintf(stderr, "get_signature: malloc failed\n");
+        return;
+    }
+
+    memcpy(buf, password, password_len);
+    memcpy(buf + password_len, salt, SALT_LEN);
+
+    // compute SHA256 
+    get_data_sha(buf, hash_out, (uint32_t)combined_len, SHA256_HASH_SIZE);
+
+    // clear sensitive data 
+    memset(buf, 0, combined_len);
+    free(buf);
 }
 
 int send_register_message(const NetworkAddress_t *peer_address)
@@ -95,32 +115,31 @@ int parse_and_store_peer_list(const char *body, uint32_t body_len)
 
 }
 
-
-
-
 int main(int argc, char **argv)
 {
-    // Users should call this script with a single argument describing what 
+    // Users should call this script with a single argument describing what
     // config to use
     if (argc != 3)
     {
         fprintf(stderr, "Usage: %s <IP> <PORT>\n", argv[0]);
         exit(EXIT_FAILURE);
-    } 
+    }
 
-    my_address = (NetworkAddress_t*)malloc(sizeof(NetworkAddress_t));
+    my_address = (NetworkAddress_t *)malloc(sizeof(NetworkAddress_t));
     memset(my_address->ip, '\0', IP_LEN);
     memcpy(my_address->ip, argv[1], strlen(argv[1]));
     my_address->port = atoi(argv[2]);
 
-    if (!is_valid_ip(my_address->ip)) {
+    if (!is_valid_ip(my_address->ip))
+    {
         fprintf(stderr, ">> Invalid peer IP: %s\n", my_address->ip);
         exit(EXIT_FAILURE);
     }
-    
-    if (!is_valid_port(my_address->port)) {
-        fprintf(stderr, ">> Invalid peer port: %d\n", 
-            my_address->port);
+
+    if (!is_valid_port(my_address->port))
+    {
+        fprintf(stderr, ">> Invalid peer port: %d\n",
+                my_address->port);
         exit(EXIT_FAILURE);
     }
 
@@ -129,24 +148,24 @@ int main(int argc, char **argv)
     scanf("%16s", password);
 
     // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i=strlen(password); i<PASSWORD_LEN; i++)
+    for (int i = strlen(password); i < PASSWORD_LEN; i++)
     {
         password[i] = '\0';
     }
 
     // Most correctly, we should randomly generate our salts, but this can make
     // repeated testing difficult so feel free to use the hard coded salt below
-    char salt[SALT_LEN+1] = "0123456789ABCDEF\0";
-    //generate_random_salt(salt);
+    char salt[SALT_LEN + 1] = "0123456789ABCDEF\0";
+    // generate_random_salt(salt);
     memcpy(my_address->salt, salt, SALT_LEN);
 
-    // Setup the client and server threads 
+    // Setup the client and server threads
     pthread_t client_thread_id;
     pthread_t server_thread_id;
     pthread_create(&client_thread_id, NULL, client_thread, NULL);
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
 
-    // Wait for them to complete. 
+    // Wait for them to complete.
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
 
