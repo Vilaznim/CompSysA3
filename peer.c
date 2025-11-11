@@ -20,6 +20,11 @@ void get_signature(const void *password, int password_len, const char *salt, has
 int send_register_message(const NetworkAddress_t *peer_address);
 int parse_and_store_peer_list(const char *body, uint32_t body_len);
 
+void initialize_my_address(const char *my_ip, uint32_t my_port);
+void network_init(void);
+int network_add_peer(const NetworkAddress_t *addr); /* returns 0 on success, -1 on error */
+int network_find_index(const char *ip, uint32_t port); /* -1 if not found */
+
 // Global variables to be used by both the server and client side of the peer.
 // Note the addition of mutexs to prevent race conditions.
 NetworkAddress_t *my_address;
@@ -105,15 +110,45 @@ void get_signature(const void *password, int password_len, const char *salt, has
     free(buf);
 }
 
-int send_register_message(const NetworkAddress_t *peer_address)
+void initialize_my_address(const char *my_ip, uint32_t my_port)
 {
 
 }
+
+
+//-----------------------------------------
+
+/* initialize network globals (do this at program start) */
+void network_init(void)
+{
+    /* keep existing globals; just ensure starting clean */
+    network = NULL;
+    peer_count = 0;
+}
+
+int network_find_index(const char *ip, uint32_t port)
+{
+
+}
+
+int network_add_peer(const NetworkAddress_t *addr)
+{
+
+}
+
+//-----------------------------------------
 
 int parse_and_store_peer_list(const char *body, uint32_t body_len)
 {
 
 }
+
+int send_register_message(const NetworkAddress_t *peer_address)
+{
+
+}
+
+
 
 int main(int argc, char **argv)
 {
