@@ -22,7 +22,7 @@ int parse_and_store_peer_list(const char *body, uint32_t body_len);
 
 void initialize_my_address(const char *my_ip, uint32_t my_port);
 void network_init(void);
-int network_add_peer(const NetworkAddress_t *addr); /* returns 0 on success, -1 on error */
+int network_add_peer(const NetworkAddress_t *addr);    /* returns 0 on success, -1 on error */
 int network_find_index(const char *ip, uint32_t port); /* -1 if not found */
 
 // Global variables to be used by both the server and client side of the peer.
@@ -68,10 +68,13 @@ void *client_thread()
     memcpy(peer_address.ip, peer_ip, IP_LEN);
     peer_address.port = atoi(peer_port);
 
-        /* attempt to register with the peer the user provided */
-    if (send_register_message(&peer_address) == 0) {
+    // attempt to register with the peer the user provided
+    if (send_register_message(&peer_address) == 0)
+    {
         printf("Registration succeeded — got peer list; peer_count=%u\n", peer_count);
-    } else {
+    }
+    else
+    {
         printf("Registration failed\n");
     }
 
@@ -110,10 +113,10 @@ void get_signature(const void *password, int password_len, const char *salt, has
     memcpy(buf, password, password_len);
     memcpy(buf + password_len, salt, SALT_LEN);
 
-    // compute SHA256 
+    // compute SHA256
     get_data_sha(buf, hash_out, (uint32_t)combined_len, SHA256_HASH_SIZE);
 
-    // clear sensitive data 
+    // clear sensitive data
     memset(buf, 0, combined_len);
     free(buf);
 }
@@ -125,21 +128,24 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
     int password_len = 0;
 
 #ifdef __unix__
-    /* POSIX: use getpass to avoid echoing the password */
+    // POSIX: use getpass to avoid echoing the password
     char *gp = getpass("Enter remembered password: ");
-    if (!gp) {
+    if (!gp)
+    {
         fprintf(stderr, "initialize_my_address: getpass failed\n");
         return;
     }
     password_len = (int)strnlen(gp, PASSWORD_LEN);
-    if (password_len > PASSWORD_LEN) password_len = PASSWORD_LEN;
+    if (password_len > PASSWORD_LEN)
+        password_len = PASSWORD_LEN;
     memcpy(passwd_buf, gp, password_len);
     passwd_buf[password_len] = '\0';
     password_src = passwd_buf;
 #else
-    /* Fallback: visible input */
+    // Fallback: visible input
     printf("Enter remembered password: ");
-    if (!fgets(passwd_buf, sizeof(passwd_buf), stdin)) {
+    if (!fgets(passwd_buf, sizeof(passwd_buf), stdin))
+    {
         fprintf(stderr, "initialize_my_address: failed to read password\n");
         return;
     }
@@ -148,40 +154,42 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
     password_src = passwd_buf;
 #endif
 
-    /* Generate salt and store (generate_random_salt fills SALT_LEN bytes) */
+    // Generate salt and store (generate_random_salt fills SALT_LEN bytes)
     char salt_buf[SALT_LEN];
     generate_random_salt(salt_buf);
     memcpy(my_address->salt, salt_buf, SALT_LEN);
 
-    /* Compute signature = SHA256(password || salt) (matches Python reference) */
+    // Compute signature = SHA256(password || salt) (matches Python reference)
     get_signature(password_src, password_len, my_address->salt, my_address->signature);
 
-    /* Store IP and port (ensure NUL termination of ip field) */
+    // Store IP and port (ensure NUL termination of ip field)
     memset(my_address->ip, 0, IP_LEN);
     strncpy(my_address->ip, my_ip, IP_LEN - 1);
     my_address->port = my_port;
 
-    /* Wipe local password buffer */
+    // Wipe local password buffer
     memset(passwd_buf, 0, sizeof(passwd_buf));
 }
 
-
 //-----------------------------------------
 
-/* initialize network globals (do this at program start) */
+// initialize network globals (do this at program start)
 void network_init(void)
 {
-    /* keep existing globals; just ensure starting clean */
+    // keep existing globals; just ensure starting clean
     network = NULL;
     peer_count = 0;
 }
 
 int network_find_index(const char *ip, uint32_t port)
 {
-    if (!network) return -1;
+    if (!network)
+        return -1;
     pthread_mutex_lock(&network_mutex);
-    for (uint32_t i = 0; i < peer_count; ++i) {
-        if (strncmp(network[i]->ip, ip, IP_LEN) == 0 && network[i]->port == port) {
+    for (uint32_t i = 0; i < peer_count; ++i)
+    {
+        if (strncmp(network[i]->ip, ip, IP_LEN) == 0 && network[i]->port == port)
+        {
             pthread_mutex_unlock(&network_mutex);
             return (int)i;
         }
@@ -192,18 +200,24 @@ int network_find_index(const char *ip, uint32_t port)
 
 int network_add_peer(const NetworkAddress_t *addr)
 {
-    if (!addr) return -1;
+    if (!addr)
+        return -1;
 
     pthread_mutex_lock(&network_mutex);
 
-    /* avoid duplicates */
-    if (network_find_index(addr->ip, addr->port) != -1) {
-        pthread_mutex_unlock(&network_mutex);
-        return 0;
+    // avoid duplicates: check inline while holding mutex (no double-lock)
+    for (uint32_t i = 0; i < peer_count; ++i)
+    {
+        if (strncmp(network[i]->ip, addr->ip, IP_LEN) == 0 && network[i]->port == addr->port)
+        {
+            pthread_mutex_unlock(&network_mutex);
+            return 0; // already present
+        }
     }
 
     NetworkAddress_t **tmp = realloc(network, (peer_count + 1) * sizeof(NetworkAddress_t *));
-    if (!tmp) {
+    if (!tmp)
+    {
         fprintf(stderr, "network_add_peer: realloc failed\n");
         pthread_mutex_unlock(&network_mutex);
         return -1;
@@ -211,11 +225,13 @@ int network_add_peer(const NetworkAddress_t *addr)
     network = tmp;
 
     network[peer_count] = malloc(sizeof(NetworkAddress_t));
-    if (!network[peer_count]) {
+    if (!network[peer_count])
+    {
         fprintf(stderr, "network_add_peer: malloc failed\n");
         pthread_mutex_unlock(&network_mutex);
         return -1;
     }
+
     memcpy(network[peer_count], addr, sizeof(NetworkAddress_t));
     peer_count++;
     pthread_mutex_unlock(&network_mutex);
@@ -226,19 +242,22 @@ int network_add_peer(const NetworkAddress_t *addr)
 
 int parse_and_store_peer_list(const char *body, uint32_t body_len)
 {
-    if (!body) return -1;
-    if (body_len % PEER_ADDR_LEN != 0) {
+    if (!body)
+        return -1;
+    if (body_len % PEER_ADDR_LEN != 0)
+    {
         fprintf(stderr, "parse_and_store_peer_list: body_len %u not multiple of %d\n", body_len, PEER_ADDR_LEN);
         return -1;
     }
 
     uint32_t num_peers = body_len / PEER_ADDR_LEN;
-    for (uint32_t i = 0; i < num_peers; ++i) {
+    for (uint32_t i = 0; i < num_peers; ++i)
+    {
         const char *rec = body + i * PEER_ADDR_LEN;
         NetworkAddress_t parsed;
         memset(&parsed, 0, sizeof(parsed));
 
-        /* layout: ip[IP_LEN], port[4 network-order], salt[SALT_LEN], signature[SHA256_HASH_SIZE] */
+        // layout: ip[IP_LEN], port[4 network-order], salt[SALT_LEN], signature[SHA256_HASH_SIZE]
         memcpy(parsed.ip, rec + 0, IP_LEN);
         uint32_t netport;
         memcpy(&netport, rec + IP_LEN, 4);
@@ -246,14 +265,16 @@ int parse_and_store_peer_list(const char *body, uint32_t body_len)
         memcpy(parsed.salt, rec + IP_LEN + 4, SALT_LEN);
         memcpy(parsed.signature, rec + IP_LEN + 4 + SALT_LEN, SHA256_HASH_SIZE);
 
-        /* avoid adding ourselves */
-        if (strncmp(parsed.ip, my_address->ip, IP_LEN) == 0 && parsed.port == my_address->port) {
+        // avoid adding ourselves
+        if (strncmp(parsed.ip, my_address->ip, IP_LEN) == 0 && parsed.port == my_address->port)
+        {
             continue;
         }
 
-        if (network_add_peer(&parsed) != 0) {
+        if (network_add_peer(&parsed) != 0)
+        {
             fprintf(stderr, "parse_and_store_peer_list: failed to add peer %s:%u\n", parsed.ip, parsed.port);
-            /* keep going to try to add others */
+            // keep going to try to add others
         }
     }
 
@@ -262,7 +283,8 @@ int parse_and_store_peer_list(const char *body, uint32_t body_len)
 
 int send_register_message(const NetworkAddress_t *peer_address)
 {
-    if (!peer_address) return -1;
+    if (!peer_address)
+        return -1;
 
     RequestHeader_t req;
     memset(&req, 0, sizeof(req));
@@ -270,27 +292,30 @@ int send_register_message(const NetworkAddress_t *peer_address)
     req.port = htonl(my_address->port);
     memcpy(req.signature, my_address->signature, SHA256_HASH_SIZE);
     req.command = htonl(COMMAND_REGISTER);
-    req.length = htonl(0); /* no body */
+    req.length = htonl(0); // no body
 
     char portstr[PORT_STR_LEN];
     snprintf(portstr, sizeof(portstr), "%d", peer_address->port);
 
     int fd = compsys_helper_open_clientfd((char *)peer_address->ip, portstr);
-    if (fd < 0) {
+    if (fd < 0)
+    {
         fprintf(stderr, "send_register_message: connect failed to %s:%s\n", peer_address->ip, portstr);
         return -1;
     }
 
-    /* write request header */
-    if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN) {
+    // write request header
+    if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+    {
         fprintf(stderr, "send_register_message: write request header failed\n");
         close(fd);
         return -1;
     }
 
-    /* read reply header */
+    // read reply header
     ReplyHeader_t reply;
-    if (compsys_helper_readn(fd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+    if (compsys_helper_readn(fd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+    {
         fprintf(stderr, "send_register_message: read reply header failed\n");
         close(fd);
         return -1;
@@ -299,43 +324,57 @@ int send_register_message(const NetworkAddress_t *peer_address)
     uint32_t reply_length = ntohl(reply.length);
     uint32_t reply_status = ntohl(reply.status);
 
-    if (reply_length > MAX_MSG_LEN) {
+    if (reply_length > MAX_MSG_LEN)
+    {
         fprintf(stderr, "send_register_message: reply length too large: %u\n", reply_length);
         close(fd);
         return -1;
     }
 
-    if (reply_length > 0) {
+    if (reply_length > 0)
+    {
         char *body = malloc(reply_length);
-        if (!body) { close(fd); return -1; }
-        if (compsys_helper_readn(fd, body, reply_length) != (ssize_t)reply_length) {
+        if (!body)
+        {
+            close(fd);
+            return -1;
+        }
+        if (compsys_helper_readn(fd, body, reply_length) != (ssize_t)reply_length)
+        {
             fprintf(stderr, "send_register_message: read body failed\n");
-            free(body); close(fd); return -1;
+            free(body);
+            close(fd);
+            return -1;
         }
 
-        /* validate hash */
+        // validate hash
         hashdata_t computed;
         get_data_sha(body, computed, reply_length, SHA256_HASH_SIZE);
-        if (memcmp(computed, reply.block_hash, SHA256_HASH_SIZE) != 0) {
+        if (memcmp(computed, reply.block_hash, SHA256_HASH_SIZE) != 0)
+        {
             fprintf(stderr, "send_register_message: reply hash mismatch\n");
-            free(body); close(fd); return -1;
+            free(body);
+            close(fd);
+            return -1;
         }
 
-        if (reply_status != STATUS_OK) {
+        if (reply_status != STATUS_OK)
+        {
             fprintf(stderr, "send_register_message: reply status not OK: %u\n", reply_status);
-            free(body); close(fd); return -1;
+            free(body);
+            close(fd);
+            return -1;
         }
 
         int res = parse_and_store_peer_list(body, reply_length);
-        free(body); close(fd);
+        free(body);
+        close(fd);
         return res;
     }
 
     close(fd);
     return (reply_status == STATUS_OK) ? 0 : -1;
 }
-
-
 
 int main(int argc, char **argv)
 {
@@ -347,10 +386,18 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    my_address = (NetworkAddress_t *)malloc(sizeof(NetworkAddress_t));
-    memset(my_address->ip, '\0', IP_LEN);
-    memcpy(my_address->ip, argv[1], strlen(argv[1]));
-    my_address->port = atoi(argv[2]);
+    /* allocate and zero the my_address structure (safety) */
+    my_address = malloc(sizeof(*my_address));
+    if (!my_address)
+    {
+        fprintf(stderr, "Failed to allocate my_address\n");
+        exit(EXIT_FAILURE);
+    }
+    memset(my_address, 0, sizeof(*my_address));
+
+    /* copy IP safely (ensure NUL) and set port */
+    strncpy(my_address->ip, argv[1], IP_LEN - 1);
+    my_address->port = (uint32_t)atoi(argv[2]);
 
     if (!is_valid_ip(my_address->ip))
     {
@@ -365,8 +412,11 @@ int main(int argc, char **argv)
         exit(EXIT_FAILURE);
     }
 
-    /* Initialise identity: prompts once, generates salt, computes signature */
+    // Initialise identity: prompts once, generates salt, computes signature
     initialize_my_address(argv[1], my_address->port);
+
+    /* initialize network globals */
+    network_init();
 
     // Setup the client and server threads
     pthread_t client_thread_id;
