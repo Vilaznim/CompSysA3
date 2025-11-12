@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -20,10 +21,14 @@ void get_signature(const void *password, int password_len, const char *salt, has
 int send_register_message(const NetworkAddress_t *peer_address);
 int parse_and_store_peer_list(const char *body, uint32_t body_len);
 
-void initialize_my_address(const char *my_ip, uint32_t my_port);
+int initialize_my_address(const char *my_ip, uint32_t my_port);
 void network_init(void);
 int network_add_peer(const NetworkAddress_t *addr);    /* returns 0 on success, -1 on error */
 int network_find_index(const char *ip, uint32_t port); /* -1 if not found */
+
+void *handle_server_request_thread(void *arg);
+void handle_register_request(int connfd, const RequestHeader_t *req, const char *body, uint32_t body_len);
+void send_response(int connfd, uint32_t status, const char *body, uint32_t body_len);
 
 // Global variables to be used by both the server and client side of the peer.
 // Note the addition of mutexs to prevent race conditions.
@@ -90,10 +95,217 @@ void *client_thread()
  */
 void *server_thread()
 {
-    // You should never see this printed in your finished implementation
-    printf("Server thread done\n");
+    char portstr[PORT_STR_LEN];
+    snprintf(portstr, sizeof(portstr), "%u", my_address->port);
 
+    int listenfd = compsys_helper_open_listenfd(portstr);
+    if (listenfd < 0) {
+        fprintf(stderr, "server_thread: open_listenfd failed for port %s\n", portstr);
+        return NULL;
+    }
+
+    while (1) {
+        struct sockaddr_storage clientaddr;
+        socklen_t clientlen = sizeof(clientaddr);
+        int connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
+        if (connfd < 0) {
+            // transient errors should be ignored; log unexpected ones
+            perror("accept");
+            continue;
+        }
+
+        // pass the connfd to handler thread via malloc'd int
+        int *pconn = malloc(sizeof(int));
+        if (!pconn) { close(connfd); continue; }
+        *pconn = connfd;
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, handle_server_request_thread, pconn) != 0) {
+            perror("pthread_create");
+            free(pconn);
+            close(connfd);
+            continue;
+        }
+        // not joining; the handler will call pthread_detach on itself
+    }
+
+    // never reached normally
+    close(listenfd);
     return NULL;
+}
+
+void *handle_server_request_thread(void *arg)
+{
+    pthread_detach(pthread_self());
+
+    int connfd = *(int *)arg;
+    free(arg);
+
+    compsys_helper_state_t rstate;
+    compsys_helper_readinitb(&rstate, connfd);
+
+    RequestHeader_t req;
+    ssize_t hr = compsys_helper_readnb(&rstate, &req, REQUEST_HEADER_LEN);
+    if (hr != REQUEST_HEADER_LEN) {
+        // malformed or closed connection
+        close(connfd);
+        return NULL;
+    }
+
+    /* debug: show incoming header info */
+    {
+        char tmp_ip[IP_LEN];
+        memcpy(tmp_ip, req.ip, IP_LEN);
+        tmp_ip[IP_LEN-1] = '\0';
+        uint32_t tmp_port = ntohl(req.port);
+        uint32_t tmp_cmd = ntohl(req.command);
+        uint32_t tmp_len = ntohl(req.length);
+        printf("Server: got header from %s:%u cmd=%u len=%u\n", tmp_ip, tmp_port, tmp_cmd, tmp_len);
+    }
+
+    uint32_t body_len = ntohl(req.length);
+    if (body_len > MAX_MSG_LEN) {
+        fprintf(stderr, "handler: incoming body_len too large: %u\n", body_len);
+        close(connfd);
+        return NULL;
+    }
+
+    char *body = NULL;
+    if (body_len > 0) {
+        body = malloc(body_len);
+        if (!body) { close(connfd); return NULL; }
+        if (compsys_helper_readnb(&rstate, body, body_len) != (ssize_t)body_len) {
+            free(body); close(connfd); return NULL;
+        }
+    }
+
+    uint32_t cmd = ntohl(req.command);
+    if (cmd == COMMAND_REGISTER) {
+        handle_register_request(connfd, &req, body, body_len);
+    } else {
+        // Unknown command: respond with STATUS_BAD_REQUEST
+        send_response(connfd, STATUS_BAD_REQUEST, NULL, 0);
+    }
+
+    free(body);
+    close(connfd);
+    return NULL;
+}
+
+void handle_register_request(int connfd, const RequestHeader_t *req, const char *body, uint32_t body_len)
+{
+    (void)body;
+    (void)body_len;
+    // Extract IP and port from the request header
+    char req_ip[IP_LEN];
+    memcpy(req_ip, req->ip, IP_LEN);
+    req_ip[IP_LEN - 1] = '\0'; // ensure NUL for string ops
+
+    uint32_t req_port = ntohl(req->port);
+
+    if (!is_valid_ip(req_ip) || !is_valid_port(req_port)) {
+        send_response(connfd, STATUS_BAD_REQUEST, NULL, 0);
+        return;
+    }
+
+    // Salt-and-hash the incoming signature before storing.
+    // Incoming signature is in req->signature (SHA256_HASH_SIZE bytes).
+    char server_salt[SALT_LEN];
+    generate_random_salt(server_salt);
+
+    char combined[SHA256_HASH_SIZE + SALT_LEN];
+    memcpy(combined, req->signature, SHA256_HASH_SIZE);
+    memcpy(combined + SHA256_HASH_SIZE, server_salt, SALT_LEN);
+
+    hashdata_t stored_sig;
+    get_data_sha(combined, stored_sig, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
+    // Build new NetworkAddress_t record
+    NetworkAddress_t newpeer;
+    memset(&newpeer, 0, sizeof(newpeer));
+    memcpy(newpeer.ip, req->ip, IP_LEN);
+    newpeer.port = req_port;
+    memcpy(newpeer.salt, server_salt, SALT_LEN);
+    memcpy(newpeer.signature, stored_sig, SHA256_HASH_SIZE);
+
+    // Add to network (network_add_peer does locking). If already present, it returns 0.
+    if (network_add_peer(&newpeer) != 0) {
+        // Addition failed (allocation error...) — reply with error
+        send_response(connfd, STATUS_OTHER, NULL, 0);
+        return;
+    }
+
+    /* debug: log registration */
+    {
+        char nip[IP_LEN];
+        memcpy(nip, newpeer.ip, IP_LEN);
+        nip[IP_LEN-1] = '\0';
+        printf("Server: Registered new peer %s:%u\n", nip, newpeer.port);
+    }
+
+    // Prepare reply body by copying current network entries under lock
+    pthread_mutex_lock(&network_mutex);
+    uint32_t n = peer_count;
+    uint32_t body_sz = n * PEER_ADDR_LEN;
+    char *reply_body = NULL;
+    if (body_sz > 0) {
+        reply_body = malloc(body_sz);
+        if (!reply_body) {
+            pthread_mutex_unlock(&network_mutex);
+            send_response(connfd, STATUS_OTHER, NULL, 0);
+            return;
+        }
+        for (uint32_t i = 0; i < n; ++i) {
+            NetworkAddress_t *p = network[i];
+            char *rec = reply_body + i * PEER_ADDR_LEN;
+            memcpy(rec + 0, p->ip, IP_LEN);
+            uint32_t netport = htonl(p->port);
+            memcpy(rec + IP_LEN, &netport, 4);
+            memcpy(rec + IP_LEN + 4, p->salt, SALT_LEN);
+            memcpy(rec + IP_LEN + 4 + SALT_LEN, p->signature, SHA256_HASH_SIZE);
+        }
+    }
+    pthread_mutex_unlock(&network_mutex);
+
+    // Send OK response with peer list
+    send_response(connfd, STATUS_OK, reply_body, body_sz);
+    free(reply_body);
+}
+
+void send_response(int connfd, uint32_t status, const char *body, uint32_t body_len)
+{
+    ReplyHeader_t reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.status = htonl(status);
+    reply.length = htonl(body_len);
+
+    /* single-message reply: this_block=0 (first block), block_count=1 */
+    reply.this_block = htonl(0);
+    reply.block_count = htonl(1);
+
+    if (body_len > 0 && body != NULL) {
+        hashdata_t block_hash;
+        get_data_sha(body, block_hash, body_len, SHA256_HASH_SIZE);
+        // For single-message reply total_hash == block_hash
+        memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
+        memcpy(reply.total_hash, block_hash, SHA256_HASH_SIZE);
+    } else {
+        memset(reply.block_hash, 0, SHA256_HASH_SIZE);
+        memset(reply.total_hash, 0, SHA256_HASH_SIZE);
+    }
+
+    // write header
+    if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+        // write failed
+        return;
+    }
+
+    // write body if present
+    if (body_len > 0 && body != NULL) {
+        if (compsys_helper_writen(connfd, (void *)body, body_len) != (ssize_t)body_len) {
+            // write failed
+            return;
+        }
+    }
 }
 
 void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out)
@@ -121,7 +333,7 @@ void get_signature(const void *password, int password_len, const char *salt, has
     free(buf);
 }
 
-void initialize_my_address(const char *my_ip, uint32_t my_port)
+int initialize_my_address(const char *my_ip, uint32_t my_port)
 {
     char passwd_buf[PASSWORD_LEN + 1];
     char *password_src = NULL;
@@ -129,11 +341,11 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
 
 #ifdef __unix__
     // POSIX: use getpass to avoid echoing the password
-    char *gp = getpass("Enter remembered password: ");
+    char *gp = getpass("Enter password for this peer: ");
     if (!gp)
     {
         fprintf(stderr, "initialize_my_address: getpass failed\n");
-        return;
+        return -1;
     }
     password_len = (int)strnlen(gp, PASSWORD_LEN);
     if (password_len > PASSWORD_LEN)
@@ -147,7 +359,7 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
     if (!fgets(passwd_buf, sizeof(passwd_buf), stdin))
     {
         fprintf(stderr, "initialize_my_address: failed to read password\n");
-        return;
+        return -1;
     }
     passwd_buf[strcspn(passwd_buf, "\n")] = '\0';
     password_len = (int)strnlen(passwd_buf, PASSWORD_LEN);
@@ -169,6 +381,7 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
 
     // Wipe local password buffer
     memset(passwd_buf, 0, sizeof(passwd_buf));
+    return 0;
 }
 
 //-----------------------------------------
@@ -203,14 +416,24 @@ int network_add_peer(const NetworkAddress_t *addr)
     if (!addr)
         return -1;
 
+    // allocate new element first to avoid leaving array expanded on failure
+    NetworkAddress_t *elem = malloc(sizeof(NetworkAddress_t));
+    if (!elem)
+    {
+        fprintf(stderr, "network_add_peer: malloc(elem) failed\n");
+        return -1;
+    }
+    memcpy(elem, addr, sizeof(NetworkAddress_t));
+
     pthread_mutex_lock(&network_mutex);
 
     // avoid duplicates: check inline while holding mutex (no double-lock)
     for (uint32_t i = 0; i < peer_count; ++i)
     {
-        if (strncmp(network[i]->ip, addr->ip, IP_LEN) == 0 && network[i]->port == addr->port)
+        if (strncmp(network[i]->ip, elem->ip, IP_LEN) == 0 && network[i]->port == elem->port)
         {
             pthread_mutex_unlock(&network_mutex);
+            free(elem);
             return 0; // already present
         }
     }
@@ -220,19 +443,12 @@ int network_add_peer(const NetworkAddress_t *addr)
     {
         fprintf(stderr, "network_add_peer: realloc failed\n");
         pthread_mutex_unlock(&network_mutex);
+        free(elem);
         return -1;
     }
     network = tmp;
 
-    network[peer_count] = malloc(sizeof(NetworkAddress_t));
-    if (!network[peer_count])
-    {
-        fprintf(stderr, "network_add_peer: malloc failed\n");
-        pthread_mutex_unlock(&network_mutex);
-        return -1;
-    }
-
-    memcpy(network[peer_count], addr, sizeof(NetworkAddress_t));
+    network[peer_count] = elem;
     peer_count++;
     pthread_mutex_unlock(&network_mutex);
     return 0;
@@ -376,6 +592,8 @@ int send_register_message(const NetworkAddress_t *peer_address)
     return (reply_status == STATUS_OK) ? 0 : -1;
 }
 
+//-----------------------------------------
+
 int main(int argc, char **argv)
 {
     // Users should call this script with a single argument describing what
@@ -413,16 +631,24 @@ int main(int argc, char **argv)
     }
 
     // Initialise identity: prompts once, generates salt, computes signature
-    initialize_my_address(argv[1], my_address->port);
+    if (initialize_my_address(argv[1], my_address->port) != 0) {
+    fprintf(stderr, "Failed to initialize identity\n");
+    exit(EXIT_FAILURE);
+}
 
     /* initialize network globals */
     network_init();
 
-    // Setup the client and server threads
+    // Setup the server thread first so it is listening before client input
     pthread_t client_thread_id;
     pthread_t server_thread_id;
-    pthread_create(&client_thread_id, NULL, client_thread, NULL);
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
+
+    // small delay gives the server a moment to bind/listen before client prompts
+    // (simple approach for testing; for production use a condition variable or explicit ready signal)
+    sleep(1);
+
+    pthread_create(&client_thread_id, NULL, client_thread, NULL);
 
     // Wait for them to complete.
     pthread_join(client_thread_id, NULL);
