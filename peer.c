@@ -301,21 +301,10 @@ void *server_thread()
                 }
                 pthread_mutex_unlock(&network_mutex);
 
-                /* build reply body: copy current network entries under lock
-                 * but exclude the registering peer itself so the client receives
-                 * only *other* peers. This avoids the client filtering itself out
-                 * and ending up with zero peers when the only known peer is itself. */
+                /* build reply body: copy current network entries under lock */
                 pthread_mutex_lock(&network_mutex);
                 uint32_t n = peer_count;
-                /* count how many peers to include (exclude newpeer) */
-                uint32_t include_count = 0;
-                for (uint32_t i = 0; i < n; ++i) {
-                    NetworkAddress_t *np = network[i];
-                    if (strncmp(np->ip, newpeer.ip, IP_LEN) == 0 && np->port == newpeer.port)
-                        continue; /* skip the registering peer */
-                    include_count++;
-                }
-                uint32_t body_sz = include_count * PEER_ADDR_LEN;
+                uint32_t body_sz = n * PEER_ADDR_LEN;
                 char *reply_body = NULL;
                 if (body_sz > 0)
                 {
@@ -326,19 +315,15 @@ void *server_thread()
                         send_error_response(connfd, STATUS_OTHER, "Out of memory");
                         goto reg_done;
                     }
-                    uint32_t out_i = 0;
                     for (uint32_t i = 0; i < n; ++i)
                     {
                         NetworkAddress_t *p = network[i];
-                        if (strncmp(p->ip, newpeer.ip, IP_LEN) == 0 && p->port == newpeer.port)
-                            continue; /* skip registering peer */
-                        char *rec = reply_body + out_i * PEER_ADDR_LEN;
+                        char *rec = reply_body + i * PEER_ADDR_LEN;
                         memcpy(rec + 0, p->ip, IP_LEN);
                         uint32_t netport = htonl(p->port);
                         memcpy(rec + IP_LEN, &netport, 4);
                         memcpy(rec + IP_LEN + 4, p->salt, SALT_LEN);
                         memcpy(rec + IP_LEN + 4 + SALT_LEN, p->signature, SHA256_HASH_SIZE);
-                        out_i++;
                     }
                 }
                 pthread_mutex_unlock(&network_mutex);
@@ -1354,6 +1339,13 @@ int main(int argc, char **argv)
 
     /* initialize network globals */
     network_init();
+
+    /* Add ourselves to the network so REGISTER replies include the server
+     * address. Without this, a two-peer test will cause each peer to only
+     * learn about itself (and thus have no remote peers to contact). */
+    if (network_add_peer(my_address) != 0) {
+        fprintf(stderr, "Warning: failed to add local address to network\n");
+    }
 
     // Setup the server and client threads (start server first to avoid IO races)
     pthread_t client_thread_id;
