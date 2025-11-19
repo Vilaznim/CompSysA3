@@ -292,6 +292,15 @@ void *server_thread()
             }
             else
             {
+                /* Debug: print current peer_count and list contents after adding */
+                pthread_mutex_lock(&network_mutex);
+                fprintf(stdout, "[SERVER] DEBUG: peer_count=%u\n", peer_count);
+                for (uint32_t di = 0; di < peer_count; ++di) {
+                    NetworkAddress_t *np = network[di];
+                    fprintf(stdout, "[SERVER] DEBUG: network[%u] = %s:%u\n", di, np->ip, np->port);
+                }
+                pthread_mutex_unlock(&network_mutex);
+
                 /* build reply body: copy current network entries under lock */
                 pthread_mutex_lock(&network_mutex);
                 uint32_t n = peer_count;
