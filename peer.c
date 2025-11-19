@@ -84,6 +84,16 @@ void *client_thread()
     memcpy(peer_address.ip, peer_ip, IP_LEN);
     peer_address.port = atoi(peer_port);
 
+    /* Register with the bootstrap peer to get the network list */
+    if (send_register_message(&peer_address) == 0)
+    {
+        fprintf(stdout, "Registration succeeded — got peer list; peer_count=%u\n", peer_count);
+    }
+    else
+    {
+        fprintf(stdout, "Registration failed\n");
+    }
+
     /* Now prompt user for file(s) to retrieve from the network. This loop
      * will ask for a filename, then attempt to retrieve it from each known
      * peer (skipping ourselves) until one succeeds (exhaustive search). */
