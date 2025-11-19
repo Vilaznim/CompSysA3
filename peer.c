@@ -6,7 +6,6 @@
 #include <arpa/inet.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -21,14 +20,15 @@ void get_signature(const void *password, int password_len, const char *salt, has
 int send_register_message(const NetworkAddress_t *peer_address);
 int parse_and_store_peer_list(const char *body, uint32_t body_len);
 
-int initialize_my_address(const char *my_ip, uint32_t my_port);
+/* Prototypes for newly added helpers (INFORM, error handling, concurrency helpers) */
+int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude_ip, uint32_t exclude_port);
+int handle_inform_message(int connfd, uint32_t body_len);
+int send_error_response(int connfd, uint32_t status, const char *msg);
+
+void initialize_my_address(const char *my_ip, uint32_t my_port);
 void network_init(void);
 int network_add_peer(const NetworkAddress_t *addr);    /* returns 0 on success, -1 on error */
 int network_find_index(const char *ip, uint32_t port); /* -1 if not found */
-
-void *handle_server_request_thread(void *arg);
-void handle_register_request(int connfd, const RequestHeader_t *req, const char *body, uint32_t body_len);
-void send_response(int connfd, uint32_t status, const char *body, uint32_t body_len);
 
 // Global variables to be used by both the server and client side of the peer.
 // Note the addition of mutexs to prevent race conditions.
@@ -51,7 +51,12 @@ void *client_thread()
 {
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
-    scanf("%16s", peer_ip);
+    fflush(stdout);
+    if (!fgets(peer_ip, sizeof(peer_ip), stdin))
+    {
+        return NULL;
+    }
+    peer_ip[strcspn(peer_ip, "\n")] = '\0';
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i = strlen(peer_ip); i < IP_LEN; i++)
@@ -61,7 +66,12 @@ void *client_thread()
 
     char peer_port[PORT_STR_LEN];
     fprintf(stdout, "Enter peer port to connect to: ");
-    scanf("%16s", peer_port);
+    fflush(stdout);
+    if (!fgets(peer_port, sizeof(peer_port), stdin))
+    {
+        return NULL;
+    }
+    peer_port[strcspn(peer_port, "\n")] = '\0';
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i = strlen(peer_port); i < PORT_STR_LEN; i++)
@@ -92,220 +102,216 @@ void *client_thread()
 /*
  * Function to act as basis for running the server thread. This thread will be
  * run concurrently with the client thread, but is infinite in nature.
+ *
+ * TESTING NOTE: This is a minimal implementation to accept connections and
+ * dispatch to handlers. In a full solution, you would:
+ * - Loop infinitely accepting connections
+ * - Spawn per-connection handlers (or use accept in a loop)
+ * - Properly handle COMMAND_REGISTER, COMMAND_INFORM, COMMAND_RETRIEVE
+ * - Validate all inputs before processing
+ *
+ * For now, we just listen and accept one connection for testing purposes.
+ * Remove this stub and replace with full implementation before final submission.
  */
 void *server_thread()
 {
-    char portstr[PORT_STR_LEN];
-    snprintf(portstr, sizeof(portstr), "%u", my_address->port);
+    char port_str[PORT_STR_LEN];
+    snprintf(port_str, sizeof(port_str), "%u", my_address->port);
 
-    int listenfd = compsys_helper_open_listenfd(portstr);
-    if (listenfd < 0) {
-        fprintf(stderr, "server_thread: open_listenfd failed for port %s\n", portstr);
+    fprintf(stdout, "[SERVER] Starting listener on port %s\n", port_str);
+    int listenfd = compsys_helper_open_listenfd(port_str);
+    if (listenfd < 0)
+    {
+        fprintf(stderr, "[SERVER] Failed to open listening socket\n");
         return NULL;
     }
 
-    while (1) {
+    fprintf(stdout, "[SERVER] Listening; waiting for incoming connections...\n");
+
+    /* Accept connections in loop */
+    while (1)
+    {
         struct sockaddr_storage clientaddr;
         socklen_t clientlen = sizeof(clientaddr);
         int connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
-        if (connfd < 0) {
-            // transient errors should be ignored; log unexpected ones
-            perror("accept");
+        if (connfd < 0)
+        {
+            fprintf(stderr, "[SERVER] accept failed: %s\n", strerror(errno));
             continue;
         }
 
-        // pass the connfd to handler thread via malloc'd int
-        int *pconn = malloc(sizeof(int));
-        if (!pconn) { close(connfd); continue; }
-        *pconn = connfd;
-        pthread_t tid;
-        if (pthread_create(&tid, NULL, handle_server_request_thread, pconn) != 0) {
-            perror("pthread_create");
-            free(pconn);
+        fprintf(stdout, "[SERVER] Accepted connection\n");
+
+        /* Read request header */
+        unsigned char header[REQUEST_HEADER_LEN];
+        if (compsys_helper_readn(connfd, header, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+        {
+            fprintf(stderr, "[SERVER] Failed to read request header\n");
             close(connfd);
             continue;
         }
-        // not joining; the handler will call pthread_detach on itself
+
+        /* Parse header */
+        unsigned char *p = header;
+        char ip[IP_LEN];
+        memset(ip, 0, IP_LEN);
+        memcpy(ip, p, IP_LEN);
+        p += IP_LEN;
+
+        uint32_t port = ntohl(*(uint32_t *)p);
+        p += 4;
+        hashdata_t sig;
+        memcpy(sig, p, SHA256_HASH_SIZE);
+        p += SHA256_HASH_SIZE;
+        uint32_t command = ntohl(*(uint32_t *)p);
+        p += 4;
+        uint32_t body_len = ntohl(*(uint32_t *)p);
+
+        fprintf(stdout, "[SERVER] Received: cmd=%u, ip=%s, port=%u, len=%u\n",
+                command, ip, port, body_len);
+
+        /* Validate inputs */
+        if (!is_valid_ip(ip))
+        {
+            fprintf(stderr, "[SERVER] Invalid IP: %s\n", ip);
+            send_error_response(connfd, STATUS_BAD_REQUEST, "Invalid IP");
+            close(connfd);
+            continue;
+        }
+
+        if (!is_valid_port(port))
+        {
+            fprintf(stderr, "[SERVER] Invalid port: %u\n", port);
+            send_error_response(connfd, STATUS_BAD_REQUEST, "Invalid port");
+            close(connfd);
+            continue;
+        }
+
+        if (command != COMMAND_REGISTER && command != COMMAND_INFORM && command != COMMAND_RETREIVE)
+        {
+            fprintf(stderr, "[SERVER] Unknown command: %u\n", command);
+            send_error_response(connfd, STATUS_BAD_REQUEST, "Unknown command");
+            close(connfd);
+            continue;
+        }
+
+        /* Dispatch based on command */
+        if (command == COMMAND_REGISTER)
+        {
+            fprintf(stdout, "[SERVER] Handling REGISTER from %s:%u\n", ip, port);
+
+            /* compute server salt and stored signature = SHA(client_signature || salt) */
+            char server_salt[SALT_LEN];
+            generate_random_salt(server_salt);
+
+            unsigned char combined[SHA256_HASH_SIZE + SALT_LEN];
+            memcpy(combined, sig, SHA256_HASH_SIZE);
+            memcpy(combined + SHA256_HASH_SIZE, server_salt, SALT_LEN);
+            hashdata_t stored_sig;
+            get_data_sha(combined, stored_sig, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
+            /* build new peer record */
+            NetworkAddress_t newpeer;
+            memset(&newpeer, 0, sizeof(newpeer));
+            memcpy(newpeer.ip, ip, IP_LEN);
+            newpeer.port = port;
+            memcpy(newpeer.salt, server_salt, SALT_LEN);
+            memcpy(newpeer.signature, stored_sig, SHA256_HASH_SIZE);
+
+            if (network_add_peer(&newpeer) != 0)
+            {
+                /* failed to add: send error reply */
+                send_error_response(connfd, STATUS_OTHER, "Failed to add peer");
+            }
+            else
+            {
+                /* build reply body: copy current network entries under lock */
+                pthread_mutex_lock(&network_mutex);
+                uint32_t n = peer_count;
+                uint32_t body_sz = n * PEER_ADDR_LEN;
+                char *reply_body = NULL;
+                if (body_sz > 0)
+                {
+                    reply_body = malloc(body_sz);
+                    if (!reply_body)
+                    {
+                        pthread_mutex_unlock(&network_mutex);
+                        send_error_response(connfd, STATUS_OTHER, "Out of memory");
+                        goto reg_done;
+                    }
+                    for (uint32_t i = 0; i < n; ++i)
+                    {
+                        NetworkAddress_t *p = network[i];
+                        char *rec = reply_body + i * PEER_ADDR_LEN;
+                        memcpy(rec + 0, p->ip, IP_LEN);
+                        uint32_t netport = htonl(p->port);
+                        memcpy(rec + IP_LEN, &netport, 4);
+                        memcpy(rec + IP_LEN + 4, p->salt, SALT_LEN);
+                        memcpy(rec + IP_LEN + 4 + SALT_LEN, p->signature, SHA256_HASH_SIZE);
+                    }
+                }
+                pthread_mutex_unlock(&network_mutex);
+
+                /* compute block hash and build reply header */
+                ReplyHeader_t reply;
+                memset(&reply, 0, sizeof(reply));
+                reply.length = htonl(body_sz);
+                reply.status = htonl(STATUS_OK);
+                reply.this_block = htonl(0);
+                reply.block_count = htonl(1);
+                if (body_sz > 0 && reply_body)
+                {
+                    hashdata_t block_hash;
+                    get_data_sha((const void *)reply_body, block_hash, body_sz, SHA256_HASH_SIZE);
+                    memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
+                    memcpy(reply.total_hash, block_hash, SHA256_HASH_SIZE);
+                }
+                else
+                {
+                    memset(reply.block_hash, 0, SHA256_HASH_SIZE);
+                    memset(reply.total_hash, 0, SHA256_HASH_SIZE);
+                }
+
+                /* send header then body */
+                if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+                {
+                    fprintf(stderr, "[SERVER] Failed to write reply header\n");
+                }
+                else if (body_sz > 0 && reply_body)
+                {
+                    if (compsys_helper_writen(connfd, reply_body, body_sz) != (ssize_t)body_sz)
+                    {
+                        fprintf(stderr, "[SERVER] Failed to write reply body\n");
+                    }
+                }
+
+                free(reply_body);
+
+                /* Inform other peers (best-effort) */
+                send_inform_to_network(&newpeer, newpeer.ip, newpeer.port);
+            }
+        reg_done:;
+        }
+        else if (command == COMMAND_INFORM)
+        {
+            fprintf(stdout, "[SERVER] Handling INFORM from %s:%u\n", ip, port);
+            if (handle_inform_message(connfd, body_len) < 0)
+            {
+                fprintf(stderr, "[SERVER] Failed to handle INFORM\n");
+            }
+            /* no reply sent for INFORM */
+        }
+        else if (command == COMMAND_RETREIVE)
+        {
+            fprintf(stdout, "[SERVER] Received RETRIEVE (not yet implemented)\n");
+            send_error_response(connfd, STATUS_OTHER, "RETRIEVE not yet implemented");
+        }
+
+        close(connfd);
     }
 
-    // never reached normally
     close(listenfd);
     return NULL;
-}
-
-void *handle_server_request_thread(void *arg)
-{
-    pthread_detach(pthread_self());
-
-    int connfd = *(int *)arg;
-    free(arg);
-
-    compsys_helper_state_t rstate;
-    compsys_helper_readinitb(&rstate, connfd);
-
-    RequestHeader_t req;
-    ssize_t hr = compsys_helper_readnb(&rstate, &req, REQUEST_HEADER_LEN);
-    if (hr != REQUEST_HEADER_LEN) {
-        // malformed or closed connection
-        close(connfd);
-        return NULL;
-    }
-
-    /* debug: show incoming header info */
-    {
-        char tmp_ip[IP_LEN];
-        memcpy(tmp_ip, req.ip, IP_LEN);
-        tmp_ip[IP_LEN-1] = '\0';
-        uint32_t tmp_port = ntohl(req.port);
-        uint32_t tmp_cmd = ntohl(req.command);
-        uint32_t tmp_len = ntohl(req.length);
-        printf("Server: got header from %s:%u cmd=%u len=%u\n", tmp_ip, tmp_port, tmp_cmd, tmp_len);
-    }
-
-    uint32_t body_len = ntohl(req.length);
-    if (body_len > MAX_MSG_LEN) {
-        fprintf(stderr, "handler: incoming body_len too large: %u\n", body_len);
-        close(connfd);
-        return NULL;
-    }
-
-    char *body = NULL;
-    if (body_len > 0) {
-        body = malloc(body_len);
-        if (!body) { close(connfd); return NULL; }
-        if (compsys_helper_readnb(&rstate, body, body_len) != (ssize_t)body_len) {
-            free(body); close(connfd); return NULL;
-        }
-    }
-
-    uint32_t cmd = ntohl(req.command);
-    if (cmd == COMMAND_REGISTER) {
-        handle_register_request(connfd, &req, body, body_len);
-    } else {
-        // Unknown command: respond with STATUS_BAD_REQUEST
-        send_response(connfd, STATUS_BAD_REQUEST, NULL, 0);
-    }
-
-    free(body);
-    close(connfd);
-    return NULL;
-}
-
-void handle_register_request(int connfd, const RequestHeader_t *req, const char *body, uint32_t body_len)
-{
-    (void)body;
-    (void)body_len;
-    // Extract IP and port from the request header
-    char req_ip[IP_LEN];
-    memcpy(req_ip, req->ip, IP_LEN);
-    req_ip[IP_LEN - 1] = '\0'; // ensure NUL for string ops
-
-    uint32_t req_port = ntohl(req->port);
-
-    if (!is_valid_ip(req_ip) || !is_valid_port(req_port)) {
-        send_response(connfd, STATUS_BAD_REQUEST, NULL, 0);
-        return;
-    }
-
-    // Salt-and-hash the incoming signature before storing.
-    // Incoming signature is in req->signature (SHA256_HASH_SIZE bytes).
-    char server_salt[SALT_LEN];
-    generate_random_salt(server_salt);
-
-    char combined[SHA256_HASH_SIZE + SALT_LEN];
-    memcpy(combined, req->signature, SHA256_HASH_SIZE);
-    memcpy(combined + SHA256_HASH_SIZE, server_salt, SALT_LEN);
-
-    hashdata_t stored_sig;
-    get_data_sha(combined, stored_sig, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
-
-    // Build new NetworkAddress_t record
-    NetworkAddress_t newpeer;
-    memset(&newpeer, 0, sizeof(newpeer));
-    memcpy(newpeer.ip, req->ip, IP_LEN);
-    newpeer.port = req_port;
-    memcpy(newpeer.salt, server_salt, SALT_LEN);
-    memcpy(newpeer.signature, stored_sig, SHA256_HASH_SIZE);
-
-    // Add to network (network_add_peer does locking). If already present, it returns 0.
-    if (network_add_peer(&newpeer) != 0) {
-        // Addition failed (allocation error...) — reply with error
-        send_response(connfd, STATUS_OTHER, NULL, 0);
-        return;
-    }
-
-    /* debug: log registration */
-    {
-        char nip[IP_LEN];
-        memcpy(nip, newpeer.ip, IP_LEN);
-        nip[IP_LEN-1] = '\0';
-        printf("Server: Registered new peer %s:%u\n", nip, newpeer.port);
-    }
-
-    // Prepare reply body by copying current network entries under lock
-    pthread_mutex_lock(&network_mutex);
-    uint32_t n = peer_count;
-    uint32_t body_sz = n * PEER_ADDR_LEN;
-    char *reply_body = NULL;
-    if (body_sz > 0) {
-        reply_body = malloc(body_sz);
-        if (!reply_body) {
-            pthread_mutex_unlock(&network_mutex);
-            send_response(connfd, STATUS_OTHER, NULL, 0);
-            return;
-        }
-        for (uint32_t i = 0; i < n; ++i) {
-            NetworkAddress_t *p = network[i];
-            char *rec = reply_body + i * PEER_ADDR_LEN;
-            memcpy(rec + 0, p->ip, IP_LEN);
-            uint32_t netport = htonl(p->port);
-            memcpy(rec + IP_LEN, &netport, 4);
-            memcpy(rec + IP_LEN + 4, p->salt, SALT_LEN);
-            memcpy(rec + IP_LEN + 4 + SALT_LEN, p->signature, SHA256_HASH_SIZE);
-        }
-    }
-    pthread_mutex_unlock(&network_mutex);
-
-    // Send OK response with peer list
-    send_response(connfd, STATUS_OK, reply_body, body_sz);
-    free(reply_body);
-}
-
-void send_response(int connfd, uint32_t status, const char *body, uint32_t body_len)
-{
-    ReplyHeader_t reply;
-    memset(&reply, 0, sizeof(reply));
-    reply.status = htonl(status);
-    reply.length = htonl(body_len);
-
-    /* single-message reply: this_block=0 (first block), block_count=1 */
-    reply.this_block = htonl(0);
-    reply.block_count = htonl(1);
-
-    if (body_len > 0 && body != NULL) {
-        hashdata_t block_hash;
-        get_data_sha(body, block_hash, body_len, SHA256_HASH_SIZE);
-        // For single-message reply total_hash == block_hash
-        memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
-        memcpy(reply.total_hash, block_hash, SHA256_HASH_SIZE);
-    } else {
-        memset(reply.block_hash, 0, SHA256_HASH_SIZE);
-        memset(reply.total_hash, 0, SHA256_HASH_SIZE);
-    }
-
-    // write header
-    if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
-        // write failed
-        return;
-    }
-
-    // write body if present
-    if (body_len > 0 && body != NULL) {
-        if (compsys_helper_writen(connfd, (void *)body, body_len) != (ssize_t)body_len) {
-            // write failed
-            return;
-        }
-    }
 }
 
 void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out)
@@ -333,7 +339,7 @@ void get_signature(const void *password, int password_len, const char *salt, has
     free(buf);
 }
 
-int initialize_my_address(const char *my_ip, uint32_t my_port)
+void initialize_my_address(const char *my_ip, uint32_t my_port)
 {
     char passwd_buf[PASSWORD_LEN + 1];
     char *password_src = NULL;
@@ -341,11 +347,11 @@ int initialize_my_address(const char *my_ip, uint32_t my_port)
 
 #ifdef __unix__
     // POSIX: use getpass to avoid echoing the password
-    char *gp = getpass("Enter password for this peer: ");
+    char *gp = getpass("Enter remembered password: ");
     if (!gp)
     {
         fprintf(stderr, "initialize_my_address: getpass failed\n");
-        return -1;
+        return;
     }
     password_len = (int)strnlen(gp, PASSWORD_LEN);
     if (password_len > PASSWORD_LEN)
@@ -359,7 +365,7 @@ int initialize_my_address(const char *my_ip, uint32_t my_port)
     if (!fgets(passwd_buf, sizeof(passwd_buf), stdin))
     {
         fprintf(stderr, "initialize_my_address: failed to read password\n");
-        return -1;
+        return;
     }
     passwd_buf[strcspn(passwd_buf, "\n")] = '\0';
     password_len = (int)strnlen(passwd_buf, PASSWORD_LEN);
@@ -381,10 +387,236 @@ int initialize_my_address(const char *my_ip, uint32_t my_port)
 
     // Wipe local password buffer
     memset(passwd_buf, 0, sizeof(passwd_buf));
-    return 0;
 }
 
 //-----------------------------------------
+
+/*
+ * send_inform_to_network
+ * ----------------------
+ * Inform every known peer about a newly-joined peer. This function is
+ * best-effort: it attempts to contact each peer in the local `network`
+ * (except `exclude_ip:exclude_port` and ourselves) and sends a
+ * COMMAND_INFORM message containing `new_peer` as the message body.
+ *
+ * Implementation notes / commentary (remove or rewrite as needed):
+ * - We copy the list of peers while holding `network_mutex`, then
+ *   release the mutex before performing blocking network I/O. This keeps
+ *   the critical section small and avoids deadlocks.
+ * - INFORM messages do not expect a reply, so we simply close the
+ *   connection after writing the header+body.
+ * - All integer fields sent on the wire are converted with htonl()/ntohl().
+ *
+ * Returns 0 on (overall) success. Individual peer failures are logged but
+ * do not abort the function.
+ */
+int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude_ip, uint32_t exclude_port)
+{
+    if (!new_peer)
+        return -1;
+
+    /* copy targets under lock */
+    NetworkAddress_t *targets = NULL;
+    uint32_t targets_count = 0;
+
+    pthread_mutex_lock(&network_mutex);
+    if (peer_count > 0)
+    {
+        targets = malloc(peer_count * sizeof(NetworkAddress_t));
+        if (!targets)
+        {
+            pthread_mutex_unlock(&network_mutex);
+            fprintf(stderr, "send_inform_to_network: malloc failed\n");
+            return -1;
+        }
+
+        for (uint32_t i = 0; i < peer_count; ++i)
+        {
+            NetworkAddress_t *p = network[i];
+            /* skip ourselves */
+            if (strncmp(p->ip, my_address->ip, IP_LEN) == 0 && p->port == my_address->port)
+                continue;
+            // skip the registering peer (they already know)
+            if (exclude_ip && strncmp(p->ip, exclude_ip, IP_LEN) == 0 && p->port == exclude_port)
+                continue;
+
+            memcpy(&targets[targets_count], p, sizeof(NetworkAddress_t));
+            targets_count++;
+        }
+    }
+    pthread_mutex_unlock(&network_mutex);
+
+    // if no targets, nothing to do
+    if (targets_count == 0)
+    {
+        free(targets);
+        return 0;
+    }
+
+    /* Build request header for INFORM messages (sender's identity) */
+    RequestHeader_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.ip, my_address->ip, IP_LEN);
+    req.port = htonl(my_address->port);
+    memcpy(req.signature, my_address->signature, SHA256_HASH_SIZE);
+    req.command = htonl(COMMAND_INFORM);
+    req.length = htonl(PEER_ADDR_LEN); /* body will be one peer record */
+
+    // For each target, open connection and send header + body
+    for (uint32_t i = 0; i < targets_count; ++i)
+    {
+        NetworkAddress_t *t = &targets[i];
+        char portstr[PORT_STR_LEN];
+        snprintf(portstr, sizeof(portstr), "%u", t->port);
+
+        int fd = compsys_helper_open_clientfd(t->ip, portstr);
+        if (fd < 0)
+        {
+            fprintf(stderr, "send_inform_to_network: connect failed to %s:%s\n", t->ip, portstr);
+            continue;
+        }
+
+        // send header
+        if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+        {
+            fprintf(stderr, "send_inform_to_network: write header failed to %s:%s\n", t->ip, portstr);
+            close(fd);
+            continue;
+        }
+
+        // send body: PEER_ADDR_LEN layout (ip, port(net), salt, signature)
+        unsigned char body[PEER_ADDR_LEN];
+        unsigned char *bp = body;
+        memset(body, 0, sizeof(body));
+        memcpy(bp, new_peer->ip, IP_LEN);
+        bp += IP_LEN;
+        uint32_t port_net = htonl(new_peer->port);
+        memcpy(bp, &port_net, 4);
+        bp += 4;
+        memcpy(bp, new_peer->salt, SALT_LEN);
+        bp += SALT_LEN;
+        memcpy(bp, new_peer->signature, SHA256_HASH_SIZE);
+
+        if (compsys_helper_writen(fd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN)
+        {
+            fprintf(stderr, "send_inform_to_network: write body failed to %s:%s\n", t->ip, portstr);
+            close(fd);
+            continue;
+        }
+
+        // No reply expected for INFORM; close and continue
+        close(fd);
+    }
+
+    free(targets);
+    return 0;
+}
+
+/*
+ * handle_inform_message
+ * ---------------------
+ * Process an incoming INFORM message. The message body is expected to be
+ * exactly PEER_ADDR_LEN bytes and contain a single peer record. We parse
+ * the peer info and attempt to add it to our local network using
+ * network_add_peer(). No response is sent for INFORM messages.
+ *
+ * Implementation notes (commentary):
+ * - This function reads the body synchronously from `connfd` using the
+ *   provided robust read helper. If reading fails, the error is logged.
+ * - The function is intentionally minimal: signature checking/auth is not
+ *   performed here (you may add it later).
+ */
+int handle_inform_message(int connfd, uint32_t body_len)
+{
+    if (body_len != PEER_ADDR_LEN)
+    {
+        fprintf(stderr, "handle_inform_message: bad body_len=%u\n", body_len);
+        return -1; // nothing to send back for INFORM
+    }
+
+    unsigned char body[PEER_ADDR_LEN];
+    if (compsys_helper_readn(connfd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN)
+    {
+        fprintf(stderr, "handle_inform_message: failed to read body\n");
+        return -1;
+    }
+
+    NetworkAddress_t parsed;
+    memset(&parsed, 0, sizeof(parsed));
+    unsigned char *p = body;
+    memcpy(parsed.ip, p, IP_LEN);
+    p += IP_LEN;
+    uint32_t netport;
+    memcpy(&netport, p, 4);
+    p += 4;
+    parsed.port = ntohl(netport);
+    memcpy(parsed.salt, p, SALT_LEN);
+    p += SALT_LEN;
+    memcpy(parsed.signature, p, SHA256_HASH_SIZE);
+
+    /* Avoid adding ourselves */
+    if (strncmp(parsed.ip, my_address->ip, IP_LEN) == 0 && parsed.port == my_address->port)
+    {
+        return 0;
+    }
+
+    if (network_add_peer(&parsed) == 0)
+    {
+        fprintf(stdout, "[INFO] Added peer via INFORM: %s:%u\n", parsed.ip, parsed.port);
+    }
+    else
+    {
+        fprintf(stderr, "[WARN] Failed to add peer from INFORM: %s:%u\n", parsed.ip, parsed.port);
+    }
+
+    return 0;
+}
+
+/*
+ * send_error_response
+ * -------------------
+ * Build and send a standardized reply header indicating an error (status)
+ * and an optional textual message body for diagnostic purposes. This is a
+ * convenience helper to keep request handlers compact.
+ *
+ * Commentary for students: you can remove or rewrite this function, but it
+ * demonstrates how to assemble a ReplyHeader_t and send a body. Integer
+ * fields are converted to network order with htonl().
+ */
+int send_error_response(int connfd, uint32_t status, const char *msg)
+{
+    if (connfd < 0)
+        return -1;
+
+    uint32_t body_len = msg ? (uint32_t)strlen(msg) : 0;
+    if (body_len > MAX_MSG_LEN)
+        body_len = MAX_MSG_LEN;
+
+    ReplyHeader_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.length = htonl(body_len);
+    hdr.status = htonl(status);
+    hdr.this_block = htonl(0);
+    hdr.block_count = htonl(1);
+    /* block_hash and total_hash left zeroed for error responses */
+
+    if (compsys_helper_writen(connfd, &hdr, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+    {
+        fprintf(stderr, "send_error_response: failed to write header: %s\n", strerror(errno));
+        return -1;
+    }
+
+    if (body_len > 0)
+    {
+        if (compsys_helper_writen(connfd, (void *)msg, body_len) != (ssize_t)body_len)
+        {
+            fprintf(stderr, "send_error_response: failed to write body: %s\n", strerror(errno));
+            return -1;
+        }
+    }
+
+    return 0;
+}
 
 // initialize network globals (do this at program start)
 void network_init(void)
@@ -416,24 +648,14 @@ int network_add_peer(const NetworkAddress_t *addr)
     if (!addr)
         return -1;
 
-    // allocate new element first to avoid leaving array expanded on failure
-    NetworkAddress_t *elem = malloc(sizeof(NetworkAddress_t));
-    if (!elem)
-    {
-        fprintf(stderr, "network_add_peer: malloc(elem) failed\n");
-        return -1;
-    }
-    memcpy(elem, addr, sizeof(NetworkAddress_t));
-
     pthread_mutex_lock(&network_mutex);
 
     // avoid duplicates: check inline while holding mutex (no double-lock)
     for (uint32_t i = 0; i < peer_count; ++i)
     {
-        if (strncmp(network[i]->ip, elem->ip, IP_LEN) == 0 && network[i]->port == elem->port)
+        if (strncmp(network[i]->ip, addr->ip, IP_LEN) == 0 && network[i]->port == addr->port)
         {
             pthread_mutex_unlock(&network_mutex);
-            free(elem);
             return 0; // already present
         }
     }
@@ -443,12 +665,19 @@ int network_add_peer(const NetworkAddress_t *addr)
     {
         fprintf(stderr, "network_add_peer: realloc failed\n");
         pthread_mutex_unlock(&network_mutex);
-        free(elem);
         return -1;
     }
     network = tmp;
 
-    network[peer_count] = elem;
+    network[peer_count] = malloc(sizeof(NetworkAddress_t));
+    if (!network[peer_count])
+    {
+        fprintf(stderr, "network_add_peer: malloc failed\n");
+        pthread_mutex_unlock(&network_mutex);
+        return -1;
+    }
+
+    memcpy(network[peer_count], addr, sizeof(NetworkAddress_t));
     peer_count++;
     pthread_mutex_unlock(&network_mutex);
     return 0;
@@ -592,8 +821,6 @@ int send_register_message(const NetworkAddress_t *peer_address)
     return (reply_status == STATUS_OK) ? 0 : -1;
 }
 
-//-----------------------------------------
-
 int main(int argc, char **argv)
 {
     // Users should call this script with a single argument describing what
@@ -631,23 +858,15 @@ int main(int argc, char **argv)
     }
 
     // Initialise identity: prompts once, generates salt, computes signature
-    if (initialize_my_address(argv[1], my_address->port) != 0) {
-    fprintf(stderr, "Failed to initialize identity\n");
-    exit(EXIT_FAILURE);
-}
+    initialize_my_address(argv[1], my_address->port);
 
     /* initialize network globals */
     network_init();
 
-    // Setup the server thread first so it is listening before client input
+    // Setup the server and client threads (start server first to avoid IO races)
     pthread_t client_thread_id;
     pthread_t server_thread_id;
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
-
-    // small delay gives the server a moment to bind/listen before client prompts
-    // (simple approach for testing; for production use a condition variable or explicit ready signal)
-    sleep(1);
-
     pthread_create(&client_thread_id, NULL, client_thread, NULL);
 
     // Wait for them to complete.
@@ -656,3 +875,4 @@ int main(int argc, char **argv)
 
     exit(EXIT_SUCCESS);
 }
+// ny push :)
