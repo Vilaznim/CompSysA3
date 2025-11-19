@@ -403,7 +403,7 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
             /* skip ourselves */
             if (strncmp(p->ip, my_address->ip, IP_LEN) == 0 && p->port == my_address->port)
                 continue;
-            /* skip the registering peer (they already know) */
+            // skip the registering peer (they already know) 
             if (exclude_ip && strncmp(p->ip, exclude_ip, IP_LEN) == 0 && p->port == exclude_port)
                 continue;
 
@@ -413,7 +413,7 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
     }
     pthread_mutex_unlock(&network_mutex);
 
-    /* if no targets, nothing to do */
+    // if no targets, nothing to do 
     if (targets_count == 0) {
         free(targets);
         return 0;
@@ -428,7 +428,7 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
     req.command = htonl(COMMAND_INFORM);
     req.length = htonl(PEER_ADDR_LEN); /* body will be one peer record */
 
-    /* For each target, open connection and send header + body */
+    // For each target, open connection and send header + body
     for (uint32_t i = 0; i < targets_count; ++i) {
         NetworkAddress_t *t = &targets[i];
         char portstr[PORT_STR_LEN];
@@ -440,14 +440,14 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
             continue;
         }
 
-        /* send header */
+        // send header 
         if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN) {
             fprintf(stderr, "send_inform_to_network: write header failed to %s:%s\n", t->ip, portstr);
             close(fd);
             continue;
         }
 
-        /* send body: PEER_ADDR_LEN layout (ip, port(net), salt, signature) */
+        // send body: PEER_ADDR_LEN layout (ip, port(net), salt, signature) 
         unsigned char body[PEER_ADDR_LEN];
         unsigned char *bp = body;
         memset(body, 0, sizeof(body));
@@ -463,7 +463,7 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
             continue;
         }
 
-        /* No reply expected for INFORM; close and continue */
+        // No reply expected for INFORM; close and continue 
         close(fd);
     }
 
@@ -490,7 +490,7 @@ int handle_inform_message(int connfd, uint32_t body_len)
 {
     if (body_len != PEER_ADDR_LEN) {
         fprintf(stderr, "handle_inform_message: bad body_len=%u\n", body_len);
-        return -1; /* nothing to send back for INFORM */
+        return -1; // nothing to send back for INFORM 
     }
 
     unsigned char body[PEER_ADDR_LEN];
