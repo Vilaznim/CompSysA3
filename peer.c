@@ -997,6 +997,20 @@ int send_register_message(const NetworkAddress_t *peer_address)
         return -1;
     }
 
+    /* Client-side debug: dump the raw reply header we just read */
+    {
+        unsigned char *hb = (unsigned char *)&reply;
+        uint32_t dbg_len = ntohl(reply.length);
+        uint32_t dbg_status = ntohl(reply.status);
+        fprintf(stdout, "send_register_message: DEBUG: reply header parsed: length=%u status=%u\n", dbg_len, dbg_status);
+        fprintf(stdout, "send_register_message: DEBUG: reply header bytes (hex):");
+        for (int i = 0; i < REPLY_HEADER_LEN; ++i) {
+            if (i % 16 == 0) fprintf(stdout, "\n  ");
+            fprintf(stdout, "%02x ", hb[i]);
+        }
+        fprintf(stdout, "\n");
+    }
+
     uint32_t reply_length = ntohl(reply.length);
     uint32_t reply_status = ntohl(reply.status);
 
