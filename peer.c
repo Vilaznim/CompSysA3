@@ -51,7 +51,11 @@ void *client_thread()
 {
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
-    scanf("%16s", peer_ip);
+    fflush(stdout);
+    if (!fgets(peer_ip, sizeof(peer_ip), stdin)) {
+        return NULL;
+    }
+    peer_ip[strcspn(peer_ip, "\n")] = '\0';
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i = strlen(peer_ip); i < IP_LEN; i++)
@@ -61,7 +65,11 @@ void *client_thread()
 
     char peer_port[PORT_STR_LEN];
     fprintf(stdout, "Enter peer port to connect to: ");
-    scanf("%16s", peer_port);
+    fflush(stdout);
+    if (!fgets(peer_port, sizeof(peer_port), stdin)) {
+        return NULL;
+    }
+    peer_port[strcspn(peer_port, "\n")] = '\0';
 
     // Clean up password string as otherwise some extra chars can sneak in.
     for (int i = strlen(peer_port); i < PORT_STR_LEN; i++)
@@ -177,16 +185,85 @@ void *server_thread()
         /* Dispatch based on command */
         if (command == COMMAND_REGISTER) {
             fprintf(stdout, "[SERVER] Handling REGISTER from %s:%u\n", ip, port);
-            /* TODO: implement full registration handler; for now just ack */
-            /* Send success reply with peer list */
-            ReplyHeader_t reply;
-            memset(&reply, 0, sizeof(reply));
-            reply.length = htonl(0);
-            reply.status = htonl(STATUS_OK);
-            reply.this_block = htonl(0);
-            reply.block_count = htonl(1);
-            /* hashes left zeroed */
-            compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN);
+
+            /* compute server salt and stored signature = SHA(client_signature || salt) */
+            char server_salt[SALT_LEN];
+            generate_random_salt(server_salt);
+
+            unsigned char combined[SHA256_HASH_SIZE + SALT_LEN];
+            memcpy(combined, sig, SHA256_HASH_SIZE);
+            memcpy(combined + SHA256_HASH_SIZE, server_salt, SALT_LEN);
+            hashdata_t stored_sig;
+            get_data_sha(combined, stored_sig, SHA256_HASH_SIZE + SALT_LEN, SHA256_HASH_SIZE);
+
+            /* build new peer record */
+            NetworkAddress_t newpeer;
+            memset(&newpeer, 0, sizeof(newpeer));
+            memcpy(newpeer.ip, ip, IP_LEN);
+            newpeer.port = port;
+            memcpy(newpeer.salt, server_salt, SALT_LEN);
+            memcpy(newpeer.signature, stored_sig, SHA256_HASH_SIZE);
+
+            if (network_add_peer(&newpeer) != 0) {
+                /* failed to add: send error reply */
+                send_error_response(connfd, STATUS_OTHER, "Failed to add peer");
+            } else {
+                /* build reply body: copy current network entries under lock */
+                pthread_mutex_lock(&network_mutex);
+                uint32_t n = peer_count;
+                uint32_t body_sz = n * PEER_ADDR_LEN;
+                char *reply_body = NULL;
+                if (body_sz > 0) {
+                    reply_body = malloc(body_sz);
+                    if (!reply_body) {
+                        pthread_mutex_unlock(&network_mutex);
+                        send_error_response(connfd, STATUS_OTHER, "Out of memory");
+                        goto reg_done;
+                    }
+                    for (uint32_t i = 0; i < n; ++i) {
+                        NetworkAddress_t *p = network[i];
+                        char *rec = reply_body + i * PEER_ADDR_LEN;
+                        memcpy(rec + 0, p->ip, IP_LEN);
+                        uint32_t netport = htonl(p->port);
+                        memcpy(rec + IP_LEN, &netport, 4);
+                        memcpy(rec + IP_LEN + 4, p->salt, SALT_LEN);
+                        memcpy(rec + IP_LEN + 4 + SALT_LEN, p->signature, SHA256_HASH_SIZE);
+                    }
+                }
+                pthread_mutex_unlock(&network_mutex);
+
+                /* compute block hash and build reply header */
+                ReplyHeader_t reply;
+                memset(&reply, 0, sizeof(reply));
+                reply.length = htonl(body_sz);
+                reply.status = htonl(STATUS_OK);
+                reply.this_block = htonl(0);
+                reply.block_count = htonl(1);
+                if (body_sz > 0 && reply_body) {
+                    hashdata_t block_hash;
+                    get_data_sha((const void *)reply_body, block_hash, body_sz, SHA256_HASH_SIZE);
+                    memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
+                    memcpy(reply.total_hash, block_hash, SHA256_HASH_SIZE);
+                } else {
+                    memset(reply.block_hash, 0, SHA256_HASH_SIZE);
+                    memset(reply.total_hash, 0, SHA256_HASH_SIZE);
+                }
+
+                /* send header then body */
+                if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+                    fprintf(stderr, "[SERVER] Failed to write reply header\n");
+                } else if (body_sz > 0 && reply_body) {
+                    if (compsys_helper_writen(connfd, reply_body, body_sz) != (ssize_t)body_sz) {
+                        fprintf(stderr, "[SERVER] Failed to write reply body\n");
+                    }
+                }
+
+                free(reply_body);
+
+                /* Inform other peers (best-effort) */
+                send_inform_to_network(&newpeer, newpeer.ip, newpeer.port);
+            }
+        reg_done: ;
 
         } else if (command == COMMAND_INFORM) {
             fprintf(stdout, "[SERVER] Handling INFORM from %s:%u\n", ip, port);
@@ -735,11 +812,11 @@ int main(int argc, char **argv)
     /* initialize network globals */
     network_init();
 
-    // Setup the client and server threads
+    // Setup the server and client threads (start server first to avoid IO races)
     pthread_t client_thread_id;
     pthread_t server_thread_id;
-    pthread_create(&client_thread_id, NULL, client_thread, NULL);
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
+    pthread_create(&client_thread_id, NULL, client_thread, NULL);
 
     // Wait for them to complete.
     pthread_join(client_thread_id, NULL);
