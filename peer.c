@@ -19,6 +19,7 @@
 void get_signature(const void *password, int password_len, const char *salt, hashdata_t hash_out);
 int send_register_message(const NetworkAddress_t *peer_address);
 int parse_and_store_peer_list(const char *body, uint32_t body_len);
+int send_retrieve_message(const NetworkAddress_t *peer_address, const char *filename);
 
 /* Prototypes for newly added helpers (INFORM, error handling, concurrency helpers) */
 int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude_ip, uint32_t exclude_port);
@@ -83,19 +84,72 @@ void *client_thread()
     memcpy(peer_address.ip, peer_ip, IP_LEN);
     peer_address.port = atoi(peer_port);
 
-    // attempt to register with the peer the user provided
-    if (send_register_message(&peer_address) == 0)
+    /* Now prompt user for file(s) to retrieve from the network. This loop
+     * will ask for a filename, then attempt to retrieve it from each known
+     * peer (skipping ourselves) until one succeeds (exhaustive search). */
+    char filepath[PATH_LEN];
+    while (1)
     {
-        printf("Registration succeeded — got peer list; peer_count=%u\n", peer_count);
-    }
-    else
-    {
-        printf("Registration failed\n");
+        fprintf(stdout, "Enter path of file to retrieve (or Ctrl-D to quit): ");
+        fflush(stdout);
+        if (!fgets(filepath, sizeof(filepath), stdin))
+            break;
+        filepath[strcspn(filepath, "\n")] = '\0';
+        if (strlen(filepath) == 0)
+            continue;
+
+        /* copy the list of known peers under lock so we don't hold the lock while blocking */
+        pthread_mutex_lock(&network_mutex);
+        uint32_t n_peers = peer_count;
+        if (n_peers == 0)
+        {
+            pthread_mutex_unlock(&network_mutex);
+            fprintf(stdout, "No peers known to request from\n");
+            continue;
+        }
+
+        NetworkAddress_t *cands = malloc(n_peers * sizeof(NetworkAddress_t));
+        uint32_t cand_count = 0;
+        for (uint32_t i = 0; i < n_peers; ++i)
+        {
+            if (strncmp(network[i]->ip, my_address->ip, IP_LEN) == 0 && network[i]->port == my_address->port)
+                continue;
+            cands[cand_count++] = *network[i];
+        }
+        pthread_mutex_unlock(&network_mutex);
+
+        if (cand_count == 0)
+        {
+            free(cands);
+            fprintf(stdout, "No remote peers available to request from\n");
+            continue;
+        }
+
+        int got_it = 0;
+        for (uint32_t i = 0; i < cand_count; ++i)
+        {
+            NetworkAddress_t *peer = &cands[i];
+            fprintf(stdout, "Attempting retrieve from %s:%u ...\n", peer->ip, peer->port);
+            if (send_retrieve_message(peer, filepath) == 0)
+            {
+                fprintf(stdout, "Retrieve succeeded from %s:%u\n", peer->ip, peer->port);
+                got_it = 1;
+                break;
+            }
+            else
+            {
+                fprintf(stdout, "No file at %s:%u, trying next peer\n", peer->ip, peer->port);
+            }
+        }
+        free(cands);
+
+        if (!got_it)
+        {
+            fprintf(stderr, "Retrieve failed: file not found on any known peer\n");
+        }
     }
 
-    // You should never see this printed in your finished implementation
-    printf("Client thread done\n");
-
+    printf("Client thread exiting\n");
     return NULL;
 }
 
@@ -303,8 +357,129 @@ void *server_thread()
         }
         else if (command == COMMAND_RETREIVE)
         {
-            fprintf(stdout, "[SERVER] Received RETRIEVE (not yet implemented)\n");
-            send_error_response(connfd, STATUS_OTHER, "RETRIEVE not yet implemented");
+            fprintf(stdout, "[SERVER] Received RETRIEVE\n");
+
+            /* Read filename from body */
+            if (body_len == 0 || body_len > PATH_LEN)
+            {
+                send_error_response(connfd, STATUS_MALFORMED, "Bad filename length");
+                close(connfd);
+                continue;
+            }
+
+            char fname[PATH_LEN + 1];
+            memset(fname, 0, sizeof(fname));
+            if (compsys_helper_readn(connfd, fname, body_len) != (ssize_t)body_len)
+            {
+                fprintf(stderr, "[SERVER] RETRIEVE: failed to read filename body\n");
+                send_error_response(connfd, STATUS_MALFORMED, "Failed to read filename body");
+                close(connfd);
+                continue;
+            }
+            /* ensure NUL terminated */
+            if (body_len >= PATH_LEN)
+                fname[PATH_LEN] = '\0';
+            else
+                fname[body_len] = '\0';
+
+            fprintf(stdout, "[SERVER] RETRIEVE request for '%s'\n", fname);
+
+            /* try to open file relative to current directory */
+            FILE *f = fopen(fname, "rb");
+            if (!f)
+            {
+                fprintf(stderr, "[SERVER] RETRIEVE: file not found: %s\n", fname);
+                send_error_response(connfd, STATUS_BAD_REQUEST, "File not found");
+                close(connfd);
+                continue;
+            }
+
+            /* determine file size */
+            if (fseek(f, 0, SEEK_END) != 0)
+            {
+                fclose(f);
+                send_error_response(connfd, STATUS_OTHER, "Seek failed");
+                close(connfd);
+                continue;
+            }
+            long fsize = ftell(f);
+            if (fsize < 0)
+            {
+                fclose(f);
+                send_error_response(connfd, STATUS_OTHER, "ftell failed");
+                close(connfd);
+                continue;
+            }
+            rewind(f);
+
+            /* compute block sizing: payload per reply = MAX_MSG_LEN - REPLY_HEADER_LEN */
+            uint32_t payload_per_block = MAX_MSG_LEN - REPLY_HEADER_LEN;
+            if (payload_per_block == 0)
+                payload_per_block = 1; /* sanity */
+
+            uint32_t total_blocks = (uint32_t)((fsize + payload_per_block - 1) / payload_per_block);
+
+            /* compute total hash of file */
+            hashdata_t total_hash;
+            get_file_sha(fname, total_hash, SHA256_HASH_SIZE);
+
+            /* send each block as a separate reply message */
+            for (uint32_t b = 0; b < total_blocks; ++b)
+            {
+                uint32_t to_read = payload_per_block;
+                if ((long)to_read > fsize - (long)b * payload_per_block)
+                    to_read = (uint32_t)(fsize - (long)b * payload_per_block);
+
+                char *buf = malloc(to_read);
+                if (!buf)
+                {
+                    fclose(f);
+                    send_error_response(connfd, STATUS_OTHER, "Out of memory");
+                    break;
+                }
+
+                if (fread(buf, 1, to_read, f) != to_read)
+                {
+                    free(buf);
+                    fclose(f);
+                    send_error_response(connfd, STATUS_OTHER, "Read failed");
+                    break;
+                }
+
+                /* compute block hash */
+                hashdata_t block_hash;
+                get_data_sha(buf, block_hash, to_read, SHA256_HASH_SIZE);
+
+                ReplyHeader_t rep;
+                memset(&rep, 0, sizeof(rep));
+                rep.length = htonl(to_read);
+                rep.status = htonl(STATUS_OK);
+                rep.this_block = htonl(b);
+                rep.block_count = htonl(total_blocks);
+                memcpy(rep.block_hash, block_hash, SHA256_HASH_SIZE);
+                memcpy(rep.total_hash, total_hash, SHA256_HASH_SIZE);
+
+                if (compsys_helper_writen(connfd, &rep, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+                {
+                    fprintf(stderr, "[SERVER] RETRIEVE: failed to write reply header\n");
+                    free(buf);
+                    break;
+                }
+
+                if (to_read > 0)
+                {
+                    if (compsys_helper_writen(connfd, buf, to_read) != (ssize_t)to_read)
+                    {
+                        fprintf(stderr, "[SERVER] RETRIEVE: failed to write reply body\n");
+                        free(buf);
+                        break;
+                    }
+                }
+
+                free(buf);
+            }
+
+            fclose(f);
         }
 
         close(connfd);
@@ -821,6 +996,238 @@ int send_register_message(const NetworkAddress_t *peer_address)
     return (reply_status == STATUS_OK) ? 0 : -1;
 }
 
+/*
+ * send_retrieve_message
+ * ---------------------
+ * Send a RETRIEVE request for `filename` to the target peer and
+ * read the series of reply messages, reassembling them into a file
+ * named "retrieved_<filename>" in the current directory.
+ */
+int send_retrieve_message(const NetworkAddress_t *peer_address, const char *filename)
+{
+    if (!peer_address || !filename)
+        return -1;
+
+    size_t fn_len = strnlen(filename, PATH_LEN);
+    if (fn_len == 0 || fn_len > PATH_LEN)
+        return -1;
+
+    RequestHeader_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.ip, my_address->ip, IP_LEN);
+    req.port = htonl(my_address->port);
+    memcpy(req.signature, my_address->signature, SHA256_HASH_SIZE);
+    req.command = htonl(COMMAND_RETREIVE);
+    req.length = htonl((uint32_t)fn_len);
+
+    char portstr[PORT_STR_LEN];
+    snprintf(portstr, sizeof(portstr), "%u", peer_address->port);
+
+    int fd = compsys_helper_open_clientfd((char *)peer_address->ip, portstr);
+    if (fd < 0)
+    {
+        fprintf(stderr, "send_retrieve_message: connect failed to %s:%s\n", peer_address->ip, portstr);
+        return -1;
+    }
+
+    /* write header then filename body */
+    if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+    {
+        fprintf(stderr, "send_retrieve_message: write header failed\n");
+        close(fd);
+        return -1;
+    }
+    if (compsys_helper_writen(fd, filename, fn_len) != (ssize_t)fn_len)
+    {
+        fprintf(stderr, "send_retrieve_message: write body failed\n");
+        close(fd);
+        return -1;
+    }
+
+    /* read replies until we have all blocks */
+    ReplyHeader_t reply;
+    uint32_t expected_blocks = 0;
+    char **blocks = NULL;
+    uint32_t *block_lens = NULL;
+    uint32_t received = 0;
+    hashdata_t total_hash_expected;
+
+    while (1)
+    {
+        if (compsys_helper_readn(fd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+        {
+            fprintf(stderr, "send_retrieve_message: read reply header failed\n");
+            break;
+        }
+
+        uint32_t rlen = ntohl(reply.length);
+        uint32_t rstatus = ntohl(reply.status);
+        uint32_t rthis = ntohl(reply.this_block);
+        uint32_t rcount = ntohl(reply.block_count);
+
+        if (rstatus != STATUS_OK)
+        {
+            /* read optional body for diagnostics */
+            if (rlen > 0)
+            {
+                char *msg = malloc(rlen + 1);
+                if (msg && compsys_helper_readn(fd, msg, rlen) == (ssize_t)rlen)
+                {
+                    msg[rlen] = '\0';
+                    fprintf(stderr, "send_retrieve_message: remote error status=%u msg=%s\n", rstatus, msg);
+                }
+                free(msg);
+            }
+            else
+            {
+                fprintf(stderr, "send_retrieve_message: remote error status=%u\n", rstatus);
+            }
+            break;
+        }
+
+        /* allocate structures on first reply */
+        if (expected_blocks == 0)
+        {
+            expected_blocks = rcount;
+            if (expected_blocks == 0)
+            {
+                fprintf(stderr, "send_retrieve_message: unexpected block_count=0\n");
+                break;
+            }
+            blocks = calloc(expected_blocks, sizeof(char *));
+            block_lens = calloc(expected_blocks, sizeof(uint32_t));
+            if (!blocks || !block_lens)
+            {
+                fprintf(stderr, "send_retrieve_message: allocation failed\n");
+                break;
+            }
+            memcpy(total_hash_expected, reply.total_hash, SHA256_HASH_SIZE);
+        }
+
+        /* read body */
+        char *buf = NULL;
+        if (rlen > 0)
+        {
+            buf = malloc(rlen);
+            if (!buf)
+            {
+                fprintf(stderr, "send_retrieve_message: malloc failed for block %u\n", rthis);
+                break;
+            }
+            if (compsys_helper_readn(fd, buf, rlen) != (ssize_t)rlen)
+            {
+                fprintf(stderr, "send_retrieve_message: failed to read block body\n");
+                free(buf);
+                break;
+            }
+        }
+
+        /* validate block hash */
+        hashdata_t computed;
+        if (rlen > 0)
+            get_data_sha(buf, computed, rlen, SHA256_HASH_SIZE);
+        else
+            memset(computed, 0, SHA256_HASH_SIZE);
+
+        if (memcmp(computed, reply.block_hash, SHA256_HASH_SIZE) != 0)
+        {
+            fprintf(stderr, "send_retrieve_message: block hash mismatch for block %u\n", rthis);
+            free(buf);
+            break;
+        }
+
+        /* store block */
+        if (rthis < expected_blocks && blocks[rthis] == NULL)
+        {
+            blocks[rthis] = buf;
+            block_lens[rthis] = rlen;
+            received++;
+        }
+        else
+        {
+            /* duplicate or out-of-range */
+            free(buf);
+        }
+
+        /* if received all, reassemble */
+        if (received == expected_blocks)
+        {
+            /* compute total size */
+            uint32_t total_sz = 0;
+            for (uint32_t i = 0; i < expected_blocks; ++i)
+                total_sz += block_lens[i];
+
+            char *all = malloc(total_sz);
+            if (!all)
+            {
+                fprintf(stderr, "send_retrieve_message: out of memory assembling file\n");
+                break;
+            }
+            uint32_t off = 0;
+            for (uint32_t i = 0; i < expected_blocks; ++i)
+            {
+                if (block_lens[i] > 0)
+                {
+                    memcpy(all + off, blocks[i], block_lens[i]);
+                    off += block_lens[i];
+                }
+            }
+
+            /* verify total hash */
+            hashdata_t got_total;
+            get_data_sha(all, got_total, total_sz, SHA256_HASH_SIZE);
+            if (memcmp(got_total, total_hash_expected, SHA256_HASH_SIZE) != 0)
+            {
+                fprintf(stderr, "send_retrieve_message: total hash mismatch\n");
+                free(all);
+                break;
+            }
+
+            /* write to file "retrieved_<filename>" */
+            char outname[PATH_LEN + 32];
+            snprintf(outname, sizeof(outname), "retrieved_%s", filename);
+            FILE *of = fopen(outname, "wb");
+            if (!of)
+            {
+                fprintf(stderr, "send_retrieve_message: failed to open output file %s\n", outname);
+                free(all);
+                break;
+            }
+            if (fwrite(all, 1, total_sz, of) != total_sz)
+            {
+                fprintf(stderr, "send_retrieve_message: failed to write output file\n");
+                fclose(of);
+                free(all);
+                break;
+            }
+            fclose(of);
+            fprintf(stdout, "send_retrieve_message: wrote %u bytes to %s\n", total_sz, outname);
+            free(all);
+
+            /* cleanup */
+            for (uint32_t i = 0; i < expected_blocks; ++i)
+                free(blocks[i]);
+            free(blocks);
+            free(block_lens);
+            close(fd);
+            return 0;
+        }
+
+        /* otherwise continue reading next reply header */
+    }
+
+    /* error cleanup */
+    if (blocks)
+    {
+        for (uint32_t i = 0; i < expected_blocks; ++i)
+            free(blocks[i]);
+        free(blocks);
+    }
+    free(block_lens);
+    close(fd);
+    return -1;
+}
+
 int main(int argc, char **argv)
 {
     // Users should call this script with a single argument describing what
@@ -875,4 +1282,3 @@ int main(int argc, char **argv)
 
     exit(EXIT_SUCCESS);
 }
-// ny push :)
