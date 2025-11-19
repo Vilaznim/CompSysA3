@@ -209,9 +209,11 @@ void *server_thread()
 
         /* Read request header */
         unsigned char header[REQUEST_HEADER_LEN];
-        if (compsys_helper_readn(connfd, header, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+        ssize_t hdr_ret = compsys_helper_readn(connfd, header, REQUEST_HEADER_LEN);
+        if (hdr_ret != REQUEST_HEADER_LEN)
         {
-            fprintf(stderr, "[SERVER] Failed to read request header\n");
+            fprintf(stderr, "[SERVER] Failed to read request header: read=%zd expected=%d errno=%s\n",
+                    hdr_ret, REQUEST_HEADER_LEN, strerror(errno));
             close(connfd);
             continue;
         }
@@ -934,13 +936,21 @@ int send_register_message(const NetworkAddress_t *peer_address)
         fprintf(stderr, "send_register_message: connect failed to %s:%s\n", peer_address->ip, portstr);
         return -1;
     }
+    else
+    {
+        fprintf(stdout, "send_register_message: connected to %s:%s (fd=%d)\n", peer_address->ip, portstr, fd);
+    }
 
     // write request header
     if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
     {
-        fprintf(stderr, "send_register_message: write request header failed\n");
+        fprintf(stderr, "send_register_message: write request header failed: errno=%s\n", strerror(errno));
         close(fd);
         return -1;
+    }
+    else
+    {
+        fprintf(stdout, "send_register_message: wrote request header to %s:%s\n", peer_address->ip, portstr);
     }
 
     // read reply header
