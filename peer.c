@@ -364,6 +364,17 @@ void *server_thread()
                     }
                 }
 
+                /* Dump the raw reply header bytes (hex) for on-wire verification */
+                {
+                    unsigned char *hb = (unsigned char *)&reply;
+                    fprintf(stdout, "[SERVER] DEBUG: reply header bytes (hex):");
+                    for (int i = 0; i < REPLY_HEADER_LEN; ++i) {
+                        if (i % 16 == 0) fprintf(stdout, "\n  ");
+                        fprintf(stdout, "%02x ", hb[i]);
+                    }
+                    fprintf(stdout, "\n");
+                }
+
                 if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
                 {
                     fprintf(stderr, "[SERVER] Failed to write reply header\n");
