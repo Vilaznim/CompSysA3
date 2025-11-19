@@ -52,7 +52,8 @@ void *client_thread()
     char peer_ip[IP_LEN];
     fprintf(stdout, "Enter peer IP to connect to: ");
     fflush(stdout);
-    if (!fgets(peer_ip, sizeof(peer_ip), stdin)) {
+    if (!fgets(peer_ip, sizeof(peer_ip), stdin))
+    {
         return NULL;
     }
     peer_ip[strcspn(peer_ip, "\n")] = '\0';
@@ -66,7 +67,8 @@ void *client_thread()
     char peer_port[PORT_STR_LEN];
     fprintf(stdout, "Enter peer port to connect to: ");
     fflush(stdout);
-    if (!fgets(peer_port, sizeof(peer_port), stdin)) {
+    if (!fgets(peer_port, sizeof(peer_port), stdin))
+    {
         return NULL;
     }
     peer_port[strcspn(peer_port, "\n")] = '\0';
@@ -118,7 +120,8 @@ void *server_thread()
 
     fprintf(stdout, "[SERVER] Starting listener on port %s\n", port_str);
     int listenfd = compsys_helper_open_listenfd(port_str);
-    if (listenfd < 0) {
+    if (listenfd < 0)
+    {
         fprintf(stderr, "[SERVER] Failed to open listening socket\n");
         return NULL;
     }
@@ -126,11 +129,13 @@ void *server_thread()
     fprintf(stdout, "[SERVER] Listening; waiting for incoming connections...\n");
 
     /* Accept connections in loop */
-    while (1) {
+    while (1)
+    {
         struct sockaddr_storage clientaddr;
         socklen_t clientlen = sizeof(clientaddr);
         int connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
-        if (connfd < 0) {
+        if (connfd < 0)
+        {
             fprintf(stderr, "[SERVER] accept failed: %s\n", strerror(errno));
             continue;
         }
@@ -139,7 +144,8 @@ void *server_thread()
 
         /* Read request header */
         unsigned char header[REQUEST_HEADER_LEN];
-        if (compsys_helper_readn(connfd, header, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN) {
+        if (compsys_helper_readn(connfd, header, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+        {
             fprintf(stderr, "[SERVER] Failed to read request header\n");
             close(connfd);
             continue;
@@ -149,33 +155,40 @@ void *server_thread()
         unsigned char *p = header;
         char ip[IP_LEN];
         memset(ip, 0, IP_LEN);
-        memcpy(ip, p, IP_LEN); p += IP_LEN;
+        memcpy(ip, p, IP_LEN);
+        p += IP_LEN;
 
-        uint32_t port = ntohl(*(uint32_t *)p); p += 4;
+        uint32_t port = ntohl(*(uint32_t *)p);
+        p += 4;
         hashdata_t sig;
-        memcpy(sig, p, SHA256_HASH_SIZE); p += SHA256_HASH_SIZE;
-        uint32_t command = ntohl(*(uint32_t *)p); p += 4;
+        memcpy(sig, p, SHA256_HASH_SIZE);
+        p += SHA256_HASH_SIZE;
+        uint32_t command = ntohl(*(uint32_t *)p);
+        p += 4;
         uint32_t body_len = ntohl(*(uint32_t *)p);
 
         fprintf(stdout, "[SERVER] Received: cmd=%u, ip=%s, port=%u, len=%u\n",
                 command, ip, port, body_len);
 
         /* Validate inputs */
-        if (!is_valid_ip(ip)) {
+        if (!is_valid_ip(ip))
+        {
             fprintf(stderr, "[SERVER] Invalid IP: %s\n", ip);
             send_error_response(connfd, STATUS_BAD_REQUEST, "Invalid IP");
             close(connfd);
             continue;
         }
 
-        if (!is_valid_port(port)) {
+        if (!is_valid_port(port))
+        {
             fprintf(stderr, "[SERVER] Invalid port: %u\n", port);
             send_error_response(connfd, STATUS_BAD_REQUEST, "Invalid port");
             close(connfd);
             continue;
         }
 
-        if (command != COMMAND_REGISTER && command != COMMAND_INFORM && command != COMMAND_RETREIVE) {
+        if (command != COMMAND_REGISTER && command != COMMAND_INFORM && command != COMMAND_RETREIVE)
+        {
             fprintf(stderr, "[SERVER] Unknown command: %u\n", command);
             send_error_response(connfd, STATUS_BAD_REQUEST, "Unknown command");
             close(connfd);
@@ -183,7 +196,8 @@ void *server_thread()
         }
 
         /* Dispatch based on command */
-        if (command == COMMAND_REGISTER) {
+        if (command == COMMAND_REGISTER)
+        {
             fprintf(stdout, "[SERVER] Handling REGISTER from %s:%u\n", ip, port);
 
             /* compute server salt and stored signature = SHA(client_signature || salt) */
@@ -204,23 +218,29 @@ void *server_thread()
             memcpy(newpeer.salt, server_salt, SALT_LEN);
             memcpy(newpeer.signature, stored_sig, SHA256_HASH_SIZE);
 
-            if (network_add_peer(&newpeer) != 0) {
+            if (network_add_peer(&newpeer) != 0)
+            {
                 /* failed to add: send error reply */
                 send_error_response(connfd, STATUS_OTHER, "Failed to add peer");
-            } else {
+            }
+            else
+            {
                 /* build reply body: copy current network entries under lock */
                 pthread_mutex_lock(&network_mutex);
                 uint32_t n = peer_count;
                 uint32_t body_sz = n * PEER_ADDR_LEN;
                 char *reply_body = NULL;
-                if (body_sz > 0) {
+                if (body_sz > 0)
+                {
                     reply_body = malloc(body_sz);
-                    if (!reply_body) {
+                    if (!reply_body)
+                    {
                         pthread_mutex_unlock(&network_mutex);
                         send_error_response(connfd, STATUS_OTHER, "Out of memory");
                         goto reg_done;
                     }
-                    for (uint32_t i = 0; i < n; ++i) {
+                    for (uint32_t i = 0; i < n; ++i)
+                    {
                         NetworkAddress_t *p = network[i];
                         char *rec = reply_body + i * PEER_ADDR_LEN;
                         memcpy(rec + 0, p->ip, IP_LEN);
@@ -239,21 +259,28 @@ void *server_thread()
                 reply.status = htonl(STATUS_OK);
                 reply.this_block = htonl(0);
                 reply.block_count = htonl(1);
-                if (body_sz > 0 && reply_body) {
+                if (body_sz > 0 && reply_body)
+                {
                     hashdata_t block_hash;
                     get_data_sha((const void *)reply_body, block_hash, body_sz, SHA256_HASH_SIZE);
                     memcpy(reply.block_hash, block_hash, SHA256_HASH_SIZE);
                     memcpy(reply.total_hash, block_hash, SHA256_HASH_SIZE);
-                } else {
+                }
+                else
+                {
                     memset(reply.block_hash, 0, SHA256_HASH_SIZE);
                     memset(reply.total_hash, 0, SHA256_HASH_SIZE);
                 }
 
                 /* send header then body */
-                if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+                if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+                {
                     fprintf(stderr, "[SERVER] Failed to write reply header\n");
-                } else if (body_sz > 0 && reply_body) {
-                    if (compsys_helper_writen(connfd, reply_body, body_sz) != (ssize_t)body_sz) {
+                }
+                else if (body_sz > 0 && reply_body)
+                {
+                    if (compsys_helper_writen(connfd, reply_body, body_sz) != (ssize_t)body_sz)
+                    {
                         fprintf(stderr, "[SERVER] Failed to write reply body\n");
                     }
                 }
@@ -263,16 +290,19 @@ void *server_thread()
                 /* Inform other peers (best-effort) */
                 send_inform_to_network(&newpeer, newpeer.ip, newpeer.port);
             }
-        reg_done: ;
-
-        } else if (command == COMMAND_INFORM) {
+        reg_done:;
+        }
+        else if (command == COMMAND_INFORM)
+        {
             fprintf(stdout, "[SERVER] Handling INFORM from %s:%u\n", ip, port);
-            if (handle_inform_message(connfd, body_len) < 0) {
+            if (handle_inform_message(connfd, body_len) < 0)
+            {
                 fprintf(stderr, "[SERVER] Failed to handle INFORM\n");
             }
             /* no reply sent for INFORM */
-
-        } else if (command == COMMAND_RETREIVE) {
+        }
+        else if (command == COMMAND_RETREIVE)
+        {
             fprintf(stdout, "[SERVER] Received RETRIEVE (not yet implemented)\n");
             send_error_response(connfd, STATUS_OTHER, "RETRIEVE not yet implemented");
         }
@@ -390,20 +420,23 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
     uint32_t targets_count = 0;
 
     pthread_mutex_lock(&network_mutex);
-    if (peer_count > 0) {
+    if (peer_count > 0)
+    {
         targets = malloc(peer_count * sizeof(NetworkAddress_t));
-        if (!targets) {
+        if (!targets)
+        {
             pthread_mutex_unlock(&network_mutex);
             fprintf(stderr, "send_inform_to_network: malloc failed\n");
             return -1;
         }
 
-        for (uint32_t i = 0; i < peer_count; ++i) {
+        for (uint32_t i = 0; i < peer_count; ++i)
+        {
             NetworkAddress_t *p = network[i];
             /* skip ourselves */
             if (strncmp(p->ip, my_address->ip, IP_LEN) == 0 && p->port == my_address->port)
                 continue;
-            // skip the registering peer (they already know) 
+            // skip the registering peer (they already know)
             if (exclude_ip && strncmp(p->ip, exclude_ip, IP_LEN) == 0 && p->port == exclude_port)
                 continue;
 
@@ -413,8 +446,9 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
     }
     pthread_mutex_unlock(&network_mutex);
 
-    // if no targets, nothing to do 
-    if (targets_count == 0) {
+    // if no targets, nothing to do
+    if (targets_count == 0)
+    {
         free(targets);
         return 0;
     }
@@ -429,48 +463,54 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
     req.length = htonl(PEER_ADDR_LEN); /* body will be one peer record */
 
     // For each target, open connection and send header + body
-    for (uint32_t i = 0; i < targets_count; ++i) {
+    for (uint32_t i = 0; i < targets_count; ++i)
+    {
         NetworkAddress_t *t = &targets[i];
         char portstr[PORT_STR_LEN];
         snprintf(portstr, sizeof(portstr), "%u", t->port);
 
         int fd = compsys_helper_open_clientfd(t->ip, portstr);
-        if (fd < 0) {
+        if (fd < 0)
+        {
             fprintf(stderr, "send_inform_to_network: connect failed to %s:%s\n", t->ip, portstr);
             continue;
         }
 
-        // send header 
-        if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN) {
+        // send header
+        if (compsys_helper_writen(fd, &req, REQUEST_HEADER_LEN) != REQUEST_HEADER_LEN)
+        {
             fprintf(stderr, "send_inform_to_network: write header failed to %s:%s\n", t->ip, portstr);
             close(fd);
             continue;
         }
 
-        // send body: PEER_ADDR_LEN layout (ip, port(net), salt, signature) 
+        // send body: PEER_ADDR_LEN layout (ip, port(net), salt, signature)
         unsigned char body[PEER_ADDR_LEN];
         unsigned char *bp = body;
         memset(body, 0, sizeof(body));
-        memcpy(bp, new_peer->ip, IP_LEN); bp += IP_LEN;
+        memcpy(bp, new_peer->ip, IP_LEN);
+        bp += IP_LEN;
         uint32_t port_net = htonl(new_peer->port);
-        memcpy(bp, &port_net, 4); bp += 4;
-        memcpy(bp, new_peer->salt, SALT_LEN); bp += SALT_LEN;
+        memcpy(bp, &port_net, 4);
+        bp += 4;
+        memcpy(bp, new_peer->salt, SALT_LEN);
+        bp += SALT_LEN;
         memcpy(bp, new_peer->signature, SHA256_HASH_SIZE);
 
-        if (compsys_helper_writen(fd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN) {
+        if (compsys_helper_writen(fd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN)
+        {
             fprintf(stderr, "send_inform_to_network: write body failed to %s:%s\n", t->ip, portstr);
             close(fd);
             continue;
         }
 
-        // No reply expected for INFORM; close and continue 
+        // No reply expected for INFORM; close and continue
         close(fd);
     }
 
     free(targets);
     return 0;
 }
-
 
 /*
  * handle_inform_message
@@ -488,13 +528,15 @@ int send_inform_to_network(const NetworkAddress_t *new_peer, const char *exclude
  */
 int handle_inform_message(int connfd, uint32_t body_len)
 {
-    if (body_len != PEER_ADDR_LEN) {
+    if (body_len != PEER_ADDR_LEN)
+    {
         fprintf(stderr, "handle_inform_message: bad body_len=%u\n", body_len);
-        return -1; // nothing to send back for INFORM 
+        return -1; // nothing to send back for INFORM
     }
 
     unsigned char body[PEER_ADDR_LEN];
-    if (compsys_helper_readn(connfd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN) {
+    if (compsys_helper_readn(connfd, body, PEER_ADDR_LEN) != PEER_ADDR_LEN)
+    {
         fprintf(stderr, "handle_inform_message: failed to read body\n");
         return -1;
     }
@@ -502,27 +544,33 @@ int handle_inform_message(int connfd, uint32_t body_len)
     NetworkAddress_t parsed;
     memset(&parsed, 0, sizeof(parsed));
     unsigned char *p = body;
-    memcpy(parsed.ip, p, IP_LEN); p += IP_LEN;
+    memcpy(parsed.ip, p, IP_LEN);
+    p += IP_LEN;
     uint32_t netport;
-    memcpy(&netport, p, 4); p += 4;
+    memcpy(&netport, p, 4);
+    p += 4;
     parsed.port = ntohl(netport);
-    memcpy(parsed.salt, p, SALT_LEN); p += SALT_LEN;
+    memcpy(parsed.salt, p, SALT_LEN);
+    p += SALT_LEN;
     memcpy(parsed.signature, p, SHA256_HASH_SIZE);
 
     /* Avoid adding ourselves */
-    if (strncmp(parsed.ip, my_address->ip, IP_LEN) == 0 && parsed.port == my_address->port) {
+    if (strncmp(parsed.ip, my_address->ip, IP_LEN) == 0 && parsed.port == my_address->port)
+    {
         return 0;
     }
 
-    if (network_add_peer(&parsed) == 0) {
+    if (network_add_peer(&parsed) == 0)
+    {
         fprintf(stdout, "[INFO] Added peer via INFORM: %s:%u\n", parsed.ip, parsed.port);
-    } else {
+    }
+    else
+    {
         fprintf(stderr, "[WARN] Failed to add peer from INFORM: %s:%u\n", parsed.ip, parsed.port);
     }
 
     return 0;
 }
-
 
 /*
  * send_error_response
@@ -552,13 +600,16 @@ int send_error_response(int connfd, uint32_t status, const char *msg)
     hdr.block_count = htonl(1);
     /* block_hash and total_hash left zeroed for error responses */
 
-    if (compsys_helper_writen(connfd, &hdr, REPLY_HEADER_LEN) != REPLY_HEADER_LEN) {
+    if (compsys_helper_writen(connfd, &hdr, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
+    {
         fprintf(stderr, "send_error_response: failed to write header: %s\n", strerror(errno));
         return -1;
     }
 
-    if (body_len > 0) {
-        if (compsys_helper_writen(connfd, (void *)msg, body_len) != (ssize_t)body_len) {
+    if (body_len > 0)
+    {
+        if (compsys_helper_writen(connfd, (void *)msg, body_len) != (ssize_t)body_len)
+        {
             fprintf(stderr, "send_error_response: failed to write body: %s\n", strerror(errno));
             return -1;
         }
@@ -824,4 +875,4 @@ int main(int argc, char **argv)
 
     exit(EXIT_SUCCESS);
 }
-//ny push :)
+// ny push :)
