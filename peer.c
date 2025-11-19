@@ -186,7 +186,8 @@ void *server_thread()
     int listenfd = compsys_helper_open_listenfd(port_str);
     if (listenfd < 0)
     {
-        fprintf(stderr, "[SERVER] Failed to open listening socket\n");
+        /* Print errno to aid debugging (bind/listen errors like EADDRINUSE) */
+        fprintf(stderr, "[SERVER] Failed to open listening socket: %s\n", strerror(errno));
         return NULL;
     }
 
