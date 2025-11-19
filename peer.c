@@ -349,6 +349,21 @@ void *server_thread()
                 }
 
                 /* send header then body */
+                /* Debug: print what we're about to send for the reply header/body */
+                {
+                    uint32_t send_len = ntohl(reply.length);
+                    fprintf(stdout, "[SERVER] DEBUG: about to send reply: length=%u status=%u this_block=%u block_count=%u body_sz=%u\n",
+                            send_len, ntohl(reply.status), ntohl(reply.this_block), ntohl(reply.block_count), body_sz);
+                    /* show first 8 bytes of block_hash for quick cross-check (if present) */
+                    if (send_len > 0) {
+                        fprintf(stdout, "[SERVER] DEBUG: reply.block_hash (prefix) = ");
+                        for (int bi = 0; bi < 8 && bi < SHA256_HASH_SIZE; ++bi) {
+                            fprintf(stdout, "%02x", (unsigned char)reply.block_hash[bi]);
+                        }
+                        fprintf(stdout, "\n");
+                    }
+                }
+
                 if (compsys_helper_writen(connfd, &reply, REPLY_HEADER_LEN) != REPLY_HEADER_LEN)
                 {
                     fprintf(stderr, "[SERVER] Failed to write reply header\n");
