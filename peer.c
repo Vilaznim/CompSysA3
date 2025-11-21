@@ -238,6 +238,21 @@ void *connection_worker(void *arg)
     {
         fprintf(stdout, "[SERVER] Handling REGISTER from %s:%u\n", ip, port);
 
+        /*
+         * Check for duplicate registration: if we already know this peer
+         * (same IP and port) then the protocol expects us to return the
+         * STATUS_PEER_EXISTS status rather than silently accepting.  This
+         * avoids promoting duplicate entries and gives the client clear
+         * feedback about the registration result.
+         */
+        if (network_find_index(ip, port) != -1)
+        {
+            fprintf(stdout, "[SERVER] REGISTER attempt for existing peer %s:%u\n", ip, port);
+            send_error_response(connfd, STATUS_PEER_EXISTS, "Peer already exists");
+            close(connfd);
+            return NULL;
+        }
+
         // compute server salt and stored signature = SHA(client_signature || salt)
         char server_salt[SALT_LEN];
         generate_random_salt(server_salt);
@@ -484,16 +499,6 @@ void *connection_worker(void *arg)
 /*
  * Function to act as basis for running the server thread. This thread will be
  * run concurrently with the client thread, but is infinite in nature.
- *
- * TESTING NOTE: This is a minimal implementation to accept connections and
- * dispatch to handlers. In a full solution, you would:
- * - Loop infinitely accepting connections
- * - Spawn per-connection handlers (or use accept in a loop)
- * - Properly handle COMMAND_REGISTER, COMMAND_INFORM, COMMAND_RETRIEVE
- * - Validate all inputs before processing
- *
- * For now, we just listen and accept one connection for testing purposes.
- * Remove this stub and replace with full implementation before final submission.
  */
 void *server_thread()
 {
