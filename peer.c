@@ -7,6 +7,10 @@
 #include <string.h>
 #include <time.h>
 #include <errno.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <termios.h>
 
 #ifdef __APPLE__
 #include "./endian.h"
@@ -40,6 +44,11 @@ NetworkAddress_t **network = NULL;
 uint32_t peer_count = 0;
 pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Graceful shutdown helpers
+volatile sig_atomic_t keep_running = 1; // set to 0 to request shutdown
+int listenfd_global = -1;              // set by server_thread so handler can close it
+int sig_pipe_fds[2] = {-1, -1};        // self-pipe: [0]=read end, [1]=write end
+
 /*
  * Function to act as thread for all required client interactions. This thread
  * will be run concurrently with the server_thread. It will start by requesting
@@ -52,34 +61,57 @@ pthread_mutex_t network_mutex = PTHREAD_MUTEX_INITIALIZER;
 void *client_thread()
 {
     char peer_ip[IP_LEN];
+    char peer_port[PORT_STR_LEN];
+
+    /* Use select-based prompt so the thread can be woken by signals and
+     * shutdown requests (keeps behavior consistent with later input loop). */
+    int stdin_fd = fileno(stdin);
+    struct timeval tv;
+    fd_set rfds;
+    int selret;
+
+    // Prompt for peer IP
     fprintf(stdout, "Enter peer IP to connect to: ");
     fflush(stdout);
-    if (!fgets(peer_ip, sizeof(peer_ip), stdin))
-    {
-        return NULL;
+    while (keep_running) {
+        FD_ZERO(&rfds);
+        FD_SET(stdin_fd, &rfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        selret = select(stdin_fd + 1, &rfds, NULL, NULL, &tv);
+        if (selret < 0) {
+            if (errno == EINTR) continue;
+            return NULL;
+        }
+        if (selret == 0) continue; // timeout
+        if (!fgets(peer_ip, sizeof(peer_ip), stdin)) { keep_running = 0; break; }
+        peer_ip[strcspn(peer_ip, "\n")] = '\0';
+        break;
     }
-    peer_ip[strcspn(peer_ip, "\n")] = '\0';
+    if (!keep_running) return NULL;
 
-    // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i = strlen(peer_ip); i < IP_LEN; i++)
-    {
-        peer_ip[i] = '\0';
-    }
+    // zero remainder
+    for (int i = strlen(peer_ip); i < IP_LEN; i++) peer_ip[i] = '\0';
 
-    char peer_port[PORT_STR_LEN];
+    // Prompt for peer port
     fprintf(stdout, "Enter peer port to connect to: ");
     fflush(stdout);
-    if (!fgets(peer_port, sizeof(peer_port), stdin))
-    {
-        return NULL;
+    while (keep_running) {
+        FD_ZERO(&rfds);
+        FD_SET(stdin_fd, &rfds);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        selret = select(stdin_fd + 1, &rfds, NULL, NULL, &tv);
+        if (selret < 0) {
+            if (errno == EINTR) continue;
+            return NULL;
+        }
+        if (selret == 0) continue; // timeout
+        if (!fgets(peer_port, sizeof(peer_port), stdin)) { keep_running = 0; break; }
+        peer_port[strcspn(peer_port, "\n")] = '\0';
+        break;
     }
-    peer_port[strcspn(peer_port, "\n")] = '\0';
-
-    // Clean up password string as otherwise some extra chars can sneak in.
-    for (int i = strlen(peer_port); i < PORT_STR_LEN; i++)
-    {
-        peer_port[i] = '\0';
-    }
+    if (!keep_running) return NULL;
 
     NetworkAddress_t peer_address;
     memcpy(peer_address.ip, peer_ip, IP_LEN);
@@ -101,13 +133,59 @@ void *client_thread()
     char filepath[PATH_LEN];
     while (1)
     {
+        /* Use select() with timeout so we can periodically check keep_running
+         * and exit promptly when SIGINT or a user 'quit' request occurs. */
         fprintf(stdout, "Enter path of file to retrieve (or Ctrl-C to quit): ");
         fflush(stdout);
-        if (!fgets(filepath, sizeof(filepath), stdin))
+
+        int stdin_fd = fileno(stdin);
+        struct timeval tv;
+        fd_set rfds;
+        int selret;
+        // Wait up to 1 second for input; loop to check keep_running
+        while (keep_running) {
+            FD_ZERO(&rfds);
+            FD_SET(stdin_fd, &rfds);
+            tv.tv_sec = 1;
+            tv.tv_usec = 0;
+            selret = select(stdin_fd + 1, &rfds, NULL, NULL, &tv);
+            if (selret < 0) {
+                if (errno == EINTR) continue;
+                // unexpected error, break out and shutdown
+                keep_running = 0;
+                break;
+            }
+            if (selret == 0) {
+                // timeout, re-check keep_running
+                continue;
+            }
+            // input available
+            if (!fgets(filepath, sizeof(filepath), stdin)) {
+                // EOF or error on stdin
+                keep_running = 0;
+                break;
+            }
+            filepath[strcspn(filepath, "\n")] = '\0';
             break;
-        filepath[strcspn(filepath, "\n")] = '\0';
-        if (strlen(filepath) == 0)
-            continue;
+        }
+        if (!keep_running) break;
+        if (strlen(filepath) == 0) continue;
+
+        // allow user to gracefully request shutdown
+        if (strcmp(filepath, "quit") == 0 || strcmp(filepath, "exit") == 0) {
+            fprintf(stdout, "Shutdown requested by user\n");
+            keep_running = 0;
+            if (listenfd_global >= 0) {
+                close(listenfd_global);
+                listenfd_global = -1;
+            }
+            // notify server thread via self-pipe as well
+            if (sig_pipe_fds[1] >= 0) {
+                ssize_t r = write(sig_pipe_fds[1], "x", 1);
+                (void)r;
+            }
+            break;
+        }
 
         // copy the list of known peers under lock so we don't hold the lock while blocking
         pthread_mutex_lock(&network_mutex);
@@ -514,46 +592,73 @@ void *server_thread()
         return NULL;
     }
 
+    // expose listenfd so cleanup can see it
+    listenfd_global = listenfd;
+
     fprintf(stdout, "[SERVER] Listening; waiting for incoming connections...\n");
 
-    // Accept connections in loop
-    while (1)
+    // Accept connections in loop; also wake on sig_pipe_fds[0] when SIGINT
+    while (keep_running)
     {
-        struct sockaddr_storage clientaddr;
-        socklen_t clientlen = sizeof(clientaddr);
-        int connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
-        if (connfd < 0)
-        {
-            fprintf(stderr, "[SERVER] accept failed: %s\n", strerror(errno));
-            continue;
+        fd_set rfds;
+        int maxfd = listenfd;
+        if (sig_pipe_fds[0] > maxfd) maxfd = sig_pipe_fds[0];
+        FD_ZERO(&rfds);
+        FD_SET(listenfd, &rfds);
+        if (sig_pipe_fds[0] >= 0) FD_SET(sig_pipe_fds[0], &rfds);
+
+        int sel = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (sel < 0) {
+            if (errno == EINTR) continue;
+            fprintf(stderr, "[SERVER] select failed: %s\n", strerror(errno));
+            break;
         }
 
-        fprintf(stdout, "[SERVER] Accepted connection\n");
-
-        // hand off connection to a worker thread
-        int *connfd_ptr = malloc(sizeof(int));
-        if (!connfd_ptr)
-        {
-            fprintf(stderr, "[SERVER] malloc failed for connfd_ptr\n");
-            close(connfd);
-            continue;
+        // check for shutdown signal via self-pipe
+        if (sig_pipe_fds[0] >= 0 && FD_ISSET(sig_pipe_fds[0], &rfds)) {
+            char buf[64];
+            // drain pipe 
+            ssize_t r = read(sig_pipe_fds[0], buf, sizeof(buf));
+            (void)r;
+            break; // shutdown requested
         }
-        *connfd_ptr = connfd;
-        pthread_t worker;
-        if (pthread_create(&worker, NULL, connection_worker, connfd_ptr) != 0)
-        {
-            fprintf(stderr, "[SERVER] pthread_create failed: %s\n", strerror(errno));
-            free(connfd_ptr);
-            close(connfd);
-            continue;
-        }
-        pthread_detach(worker);
 
-        // after handing connection to worker we do not process it here
-        continue;
+        if (FD_ISSET(listenfd, &rfds)) {
+            struct sockaddr_storage clientaddr;
+            socklen_t clientlen = sizeof(clientaddr);
+            int connfd = accept(listenfd, (struct sockaddr *)&clientaddr, &clientlen);
+            if (connfd < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "[SERVER] accept failed: %s\n", strerror(errno));
+                continue;
+            }
+
+            fprintf(stdout, "[SERVER] Accepted connection\n");
+
+            // hand off connection to a worker thread
+            int *connfd_ptr = malloc(sizeof(int));
+            if (!connfd_ptr)
+            {
+                fprintf(stderr, "[SERVER] malloc failed for connfd_ptr\n");
+                close(connfd);
+                continue;
+            }
+            *connfd_ptr = connfd;
+            pthread_t worker;
+            if (pthread_create(&worker, NULL, connection_worker, connfd_ptr) != 0)
+            {
+                fprintf(stderr, "[SERVER] pthread_create failed: %s\n", strerror(errno));
+                free(connfd_ptr);
+                close(connfd);
+                continue;
+            }
+            pthread_detach(worker);
+        }
     }
 
-    close(listenfd);
+    // close listening socket
+    if (listenfd >= 0) close(listenfd);
+    // close pipe read end here if still open
     return NULL;
 }
 
@@ -606,33 +711,55 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
     char passwd_buf[PASSWORD_LEN + 1];
     char *password_src = NULL;
     int password_len = 0;
-
-#ifdef __unix__
-    // POSIX: use getpass to avoid echoing the password
-    char *gp = getpass("Enter remembered password: ");
-    if (!gp)
-    {
-        fprintf(stderr, "initialize_my_address: getpass failed\n");
-        return;
+    /* Read password without using getpass(), which on some libc versions
+     * leaves an internally-allocated buffer that shows up as "still
+     * reachable" in Valgrind. Use termios to disable echo and read into a
+     * stack buffer instead. */
+    struct termios oldt, newt;
+    if (tcgetattr(STDIN_FILENO, &oldt) == 0) {
+        newt = oldt;
+        newt.c_lflag &= ~(ECHO);
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &newt) == 0) {
+            fprintf(stdout, "Enter remembered password: ");
+            fflush(stdout);
+            if (!fgets(passwd_buf, sizeof(passwd_buf), stdin)) {
+                // restore terminal
+                tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+                fprintf(stderr, "initialize_my_address: failed to read password\n");
+                return;
+            }
+            // restore terminal state and print newline since input was not echoed
+            tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+            fprintf(stdout, "\n");
+            passwd_buf[strcspn(passwd_buf, "\n")] = '\0';
+            password_len = (int)strnlen(passwd_buf, PASSWORD_LEN);
+            if (password_len > PASSWORD_LEN) password_len = PASSWORD_LEN;
+            password_src = passwd_buf;
+        } else {
+            // tcsetattr failed; fall back to visible prompt 
+            fprintf(stdout, "Enter remembered password: ");
+            fflush(stdout);
+            if (!fgets(passwd_buf, sizeof(passwd_buf), stdin)) {
+                fprintf(stderr, "initialize_my_address: failed to read password\n");
+                return;
+            }
+            passwd_buf[strcspn(passwd_buf, "\n")] = '\0';
+            password_len = (int)strnlen(passwd_buf, PASSWORD_LEN);
+            password_src = passwd_buf;
+        }
+    } else {
+        // tcgetattr failed (not a tty?), use visible input fallback
+        fprintf(stdout, "Enter remembered password: ");
+        fflush(stdout);
+        if (!fgets(passwd_buf, sizeof(passwd_buf), stdin))
+        {
+            fprintf(stderr, "initialize_my_address: failed to read password\n");
+            return;
+        }
+        passwd_buf[strcspn(passwd_buf, "\n")] = '\0';
+        password_len = (int)strnlen(passwd_buf, PASSWORD_LEN);
+        password_src = passwd_buf;
     }
-    password_len = (int)strnlen(gp, PASSWORD_LEN);
-    if (password_len > PASSWORD_LEN)
-        password_len = PASSWORD_LEN;
-    memcpy(passwd_buf, gp, password_len);
-    passwd_buf[password_len] = '\0';
-    password_src = passwd_buf;
-#else
-    // Fallback: visible input
-    printf("Enter remembered password: ");
-    if (!fgets(passwd_buf, sizeof(passwd_buf), stdin))
-    {
-        fprintf(stderr, "initialize_my_address: failed to read password\n");
-        return;
-    }
-    passwd_buf[strcspn(passwd_buf, "\n")] = '\0';
-    password_len = (int)strnlen(passwd_buf, PASSWORD_LEN);
-    password_src = passwd_buf;
-#endif
 
     // Generate salt and store (generate_random_salt fills SALT_LEN bytes)
     char salt_buf[SALT_LEN];
@@ -649,6 +776,44 @@ void initialize_my_address(const char *my_ip, uint32_t my_port)
 
     // Wipe local password buffer
     memset(passwd_buf, 0, sizeof(passwd_buf));
+}
+
+// Signal handler: request shutdown and close listening socket to unblock accept()
+static void sigint_handler(int sig)
+{
+    (void)sig;
+    keep_running = 0;
+    // notify server thread via self-pipe (write is async-signal-safe)
+    if (sig_pipe_fds[1] >= 0) {
+        ssize_t r = write(sig_pipe_fds[1], "x", 1);
+        (void)r;
+    }
+}
+
+// Free dynamic resources allocated by peer.c. Call after threads have exited.
+static void cleanup_resources(void)
+{
+    pthread_mutex_lock(&network_mutex);
+    for (uint32_t i = 0; i < peer_count; ++i) {
+        free(network[i]);
+    }
+    free(network);
+    network = NULL;
+    peer_count = 0;
+    pthread_mutex_unlock(&network_mutex);
+
+    free(my_address);
+    my_address = NULL;
+
+    // close self-pipe fds if open
+    if (sig_pipe_fds[0] >= 0) {
+        close(sig_pipe_fds[0]);
+        sig_pipe_fds[0] = -1;
+    }
+    if (sig_pipe_fds[1] >= 0) {
+        close(sig_pipe_fds[1]);
+        sig_pipe_fds[1] = -1;
+    }
 }
 
 //-----------------------------------------
@@ -1427,12 +1592,24 @@ int main(int argc, char **argv)
     // Setup the server and client threads (start server first to avoid IO races)
     pthread_t client_thread_id;
     pthread_t server_thread_id;
+    // Create self-pipe for signal -> server thread wakeup
+    if (pipe(sig_pipe_fds) != 0) {
+        fprintf(stderr, "Failed to create signal pipe: %s\n", strerror(errno));
+        // proceed without pipe; signal will still set keep_running
+        sig_pipe_fds[0] = sig_pipe_fds[1] = -1;
+    }
+
+    // Install SIGINT handler for graceful shutdown
+    signal(SIGINT, sigint_handler);
     pthread_create(&server_thread_id, NULL, server_thread, NULL);
     pthread_create(&client_thread_id, NULL, client_thread, NULL);
 
     // Wait for them to complete.
     pthread_join(client_thread_id, NULL);
     pthread_join(server_thread_id, NULL);
+
+    // free remaining resources allocated by peer.c
+    cleanup_resources();
 
     exit(EXIT_SUCCESS);
 }
