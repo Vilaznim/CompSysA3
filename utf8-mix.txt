@@ -1,0 +1,5 @@
+Blandet UTF-8-indhold:
+Dansk: æøå ÆØÅ
+Deutsch: äöü ÄÖÜ ß
+Français: éèêëàç
+Emoji: 😀 😎 🚀 ❤️

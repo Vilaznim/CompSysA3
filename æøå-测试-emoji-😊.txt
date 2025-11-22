@@ -1,0 +1,1 @@
+This filename and content use UTF-8: æøå, 测试, 😊
